@@ -1,0 +1,45 @@
+package report
+
+import (
+	"net/url"
+	"strings"
+	"testing"
+)
+
+func TestParseFFmpeg(t *testing.T) {
+	for in, want := range map[string]string{
+		"ffmpeg version 7.1 Copyright (c) 2000-2024 the FFmpeg developers\nbuilt with gcc": "7.1",
+		"ffmpeg version n6.0-12-gabc Copyright":                                            "n6.0-12-gabc",
+		"something else entirely":                                                          "",
+		"":                                                                                 "",
+	} {
+		if got := ParseFFmpeg(in); got != want {
+			t.Errorf("ParseFFmpeg(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The link round-trips the details, including characters that need escaping,
+// and says what is missing instead of leaving a blank.
+func TestURLFillsTheBugReportForm(t *testing.T) {
+	info := Info{App: "1.2.3", OS: "linux", Arch: "arm64", YtDlp: "2025.01.15", FFmpeg: ""}
+	raw := info.URL()
+	if !strings.HasPrefix(raw, "https://github.com/elianiva/meiro/issues/new?") {
+		t.Fatalf("unexpected link %s", raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	for key, want := range map[string]string{
+		"template":   "bug_report.yml",
+		"version":    "1.2.3",
+		"os-version": "linux arm64",
+		"tools":      "yt-dlp: 2025.01.15\nffmpeg: unknown",
+	} {
+		if got := q.Get(key); got != want {
+			t.Errorf("%s = %q, want %q", key, got, want)
+		}
+	}
+}

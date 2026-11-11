@@ -1,0 +1,31 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "cookies",
+    srcs = [
+        "browsers.go",
+        "chromium.go",
+        "devtools.go",
+        "discover.go",
+        "store.go",
+        "websocket.go",
+        "window.go",
+    ],
+    importpath = "github.com/elianiva/meiro/internal/cookies",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/fsutil",
+        "//internal/proc",
+        "//internal/ytdlp",
+    ],
+)
+
+go_test(
+    name = "cookies_test",
+    srcs = [
+        "cookies_test.go",
+        "window_test.go",
+    ],
+    embed = [":cookies"],
+    deps = ["//internal/proc"],
+)

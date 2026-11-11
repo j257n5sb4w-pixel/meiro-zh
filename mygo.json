@@ -1,0 +1,19 @@
+{
+  "name": "Meiro",
+  "identifier": "com.elianiva.meiro",
+  "version": "0.6.1",
+  "out": "build",
+  "urlSchemes": [
+    "meiro"
+  ],
+  "updates": {
+    "publicKey": "wI4WiYlNHJ+j7ElvtCdJV5dekixSMGACa1k4sp5hano=",
+    "github": "elianiva/meiro",
+    "tagPrefix": "desktop-v"
+  },
+  "linux": {
+    "depends": [
+      "libayatana-appindicator3-1"
+    ]
+  }
+}

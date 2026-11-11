@@ -1,0 +1,39 @@
+name: website
+
+on:
+  push:
+    branches: [master]
+    paths: ["website/**", ".github/workflows/website.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A deploy writes to production with the Cloudflare token, so only the
+    # repository owner may start it, by a push to master or by hand.
+    # triggering_actor is the user who re-ran the workflow, which actor alone
+    # would still report as the owner. A fork carries this file but not the
+    # owner, so it refuses there too.
+    if: >-
+      github.repository_owner == 'elianiva' &&
+      github.actor == 'elianiva' &&
+      github.triggering_actor == 'elianiva'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 26
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci
+      - run: npm run deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

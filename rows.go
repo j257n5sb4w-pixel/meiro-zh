@@ -1,0 +1,390 @@
+package main
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/elianiva/meiro/youtube"
+)
+
+// rowKind says what a row of a page's list holds.
+type rowKind uint8
+
+const (
+	rowHero      rowKind = iota // the heading of an album, playlist or artist
+	rowTopResult                // the card a search's results lead with
+	rowHeading                  // the name of a section, with arrows for its shelf
+	rowCards                    // a shelf of cards that scrolls sideways
+	rowColumns                  // a shelf of songs in columns that scrolls sideways
+	rowGrid                     // one line of cards in a grid that wraps across the page
+	rowTrack                    // one song, album, artist or playlist in a column of rows
+	rowMore                     // the button that asks for the next page
+	rowSimilar                  // a divider and the heading over a playlist's suggestions
+	rowLoading                  // the page is loading
+	rowError                    // the page failed
+	rowEmpty                    // the page has nothing on it
+	rowStreaming                // the rest of the page is still loading
+)
+
+// row is one line of a page's list.
+type row struct {
+	kind  rowKind
+	title string
+	// body is the line under an empty page's title.
+	body string
+	// shelf names the carousel a heading steers, and a shelf draws.
+	shelf string
+	// items are the cards or songs of a shelf; item is the one of a track row.
+	items []youtube.MusicItem
+	item  youtube.MusicItem
+	// queue is what playing from this row plays: the songs of its shelf.
+	// Track rows play from the page's songs.
+	queue []youtube.MusicItem
+	// track is the place of a song among the page's songs, or -1.
+	track    int
+	position int
+	// offline says an error row is the network being out of reach.
+	offline bool
+}
+
+// key identifies a row across frames, so the list keeps its place when the
+// rows change.
+func (r row) key() any {
+	switch r.kind {
+	case rowTrack:
+		return itemKey("track", r.item) + "\x00" + r.shelf + "#" + strconv.Itoa(r.position)
+	case rowTopResult:
+		return itemKey("top", r.item)
+	case rowGrid:
+		return strconv.Itoa(int(r.kind)) + ":" + r.shelf + "#" + strconv.Itoa(r.position)
+	case rowCards, rowColumns, rowHeading:
+		return strconv.Itoa(int(r.kind)) + ":" + r.shelf
+	case rowHero, rowMore, rowLoading, rowError, rowEmpty, rowStreaming, rowSimilar:
+	}
+	return strconv.Itoa(int(r.kind)) + ":" + r.title
+}
+
+// number is the place shown beside a song that has no artwork of its own.
+func (r row) number() int {
+	if r.track < 0 || r.item.Thumbnail != "" {
+		return 0
+	}
+	return r.track + 1
+}
+
+// rowsKey summarises what buildRows reads, cheaply. Comparing it each frame
+// rebuilds the rows whenever the page's shape changes, even when a caller did
+// not mark them stale; a content change within the same shape still marks
+// them with rowsDirty.
+type rowsKey struct {
+	path    string
+	detail  detail
+	loading bool
+	err     string
+	offline bool
+	more    string
+	moreErr string
+	// moreBusy says the next part of the page is on its way, which the list
+	// shows a spinner for. restBusy says the same of a playlist's later
+	// pages, which load on their own rather than from Show more.
+	moreBusy bool
+	restBusy bool
+	// similar is how many songs a playlist page suggests and how many of them
+	// it shows; both are zero on a page without suggestions.
+	similar      int
+	similarShown int
+	// shelves folds the sections' titles and item counts into one number, and
+	// loose is how many items a page without sections holds.
+	shelves uint64
+	loose   int
+	partial bool
+	// columns is how many cards a line of the page's grid holds; it is zero
+	// on a page without one.
+	columns int
+	// submitted is the search the rows show the results of, and top the card
+	// those results lead with.
+	submitted string
+	top       youtube.MusicItem
+	// aiVersion changes when a track's AI label is learned, so a filter
+	// inside the rows' build function gets a fresh build.
+	aiVersion uint64
+	// excludeAI is part of the key so cached pages rebuild when the user
+	// changes the setting.
+	excludeAI bool
+	// filter is the playlist search the rows show the matches of.
+	filter string
+	sort   playlistSort
+}
+
+// syncRows rebuilds the rows when the page's data changed since the last
+// build, so an idle page reuses them frame after frame.
+func (a *app) syncRows() {
+	r, _ := a.route()
+	// A click that opens the Downloads page builds rows in the same frame,
+	// while the page held is still the one being left: only once the app
+	// has caught up with the router is the page the Downloads page's own.
+	if r.id == routeDownloads && a.location == a.router.Location() {
+		a.syncDownloadsPage()
+	}
+	s := a.pageState()
+	key := rowsKey{
+		path: a.path(), detail: a.page.detail,
+		loading: s.loading, partial: s.partial, err: s.err, offline: s.offline, more: s.more, moreErr: s.moreErr,
+		moreBusy: a.pageMore.busy(), similar: len(s.similar), similarShown: s.similarShown,
+		shelves: shelfShape(s.sections), loose: len(s.items),
+		columns: a.gridColumns(r), aiVersion: a.aiFilter.generation(), excludeAI: a.settings.ExcludeAIGenerated,
+	}
+	if r.id == routeSearch {
+		key.submitted, key.top = a.search.submitted, a.search.top
+	}
+	if r.id == routePlaylist {
+		// Playlist-local controls are not page data, so the key carries them:
+		// changing either one asks for rows again.
+		key.filter, key.sort = a.detailFilter, a.detailSort
+		key.restBusy = a.pageSimilar.busy()
+	}
+	if a.page.rows == nil || a.page.rowsDirty || key != a.page.rowsKey {
+		a.page.rowsKey, a.page.rowsDirty = key, false
+		// Each page owns its rows alone, so the new ones reuse their memory.
+		a.page.rows, a.page.playable = buildRows(a.page.rows[:0], a.page.playable[:0], r, s, a.page.detail, key.top, key, a.excludesItem)
+	}
+}
+
+// shelfShape folds each section's title and item count into one number, as
+// FNV-1a: a cheap stand-in for the sections themselves.
+func shelfShape(sections []youtube.MusicSection) uint64 {
+	shape := uint64(14695981039346656037)
+	for _, section := range sections {
+		for _, r := range section.Title {
+			shape = (shape ^ uint64(r)) * 1099511628211
+		}
+		shape = (shape ^ uint64(len(section.Items))) * 1099511628211
+		shape = (shape ^ '|') * 1099511628211
+	}
+	return shape
+}
+
+// buildRows flattens a loaded page into the rows its list shows, appended to
+// rows, and collects the songs that playing the page would queue, appended
+// to playable. It reads nothing but its arguments, which key summarises. top
+// is the card a search's results lead with, which no other page has.
+func buildRows(rows []row, playable []youtube.MusicItem, r *route, s *pageState, heading detail, top youtube.MusicItem, key rowsKey, exclude func(youtube.MusicItem) bool) ([]row, []youtube.MusicItem) {
+	if r.isDetail() {
+		rows = append(rows, row{kind: rowHero, title: heading.title, track: -1})
+	}
+	switch {
+	case s.loading:
+		return append(rows, row{kind: rowLoading, track: -1}), playable
+	case s.err != "":
+		return append(rows, row{kind: rowError, title: s.err, offline: s.offline, track: -1}), playable
+	}
+	hiddenAI := false
+	keep := func(item youtube.MusicItem) bool {
+		if exclude != nil && exclude(item) {
+			hiddenAI = true
+			return false
+		}
+		return true
+	}
+	if top.Title != "" && keep(top) {
+		rows = append(rows, row{kind: rowTopResult, item: top, track: -1})
+	}
+
+	// Songs on an album or playlist page carry no artwork of their own: the
+	// page's is what they belong to, and what the player shows.
+	collection := r.isDetail() && r.target != youtube.TargetArtist
+	fallback := ""
+	if collection {
+		fallback = heading.art
+	}
+	sections := s.sections
+	if len(sections) == 0 && len(s.items) > 0 {
+		sections = []youtube.MusicSection{{Items: s.items}}
+	}
+	if exclude != nil {
+		visible := make([]youtube.MusicSection, 0, len(sections))
+		for _, section := range sections {
+			items := make([]youtube.MusicItem, 0, len(section.Items))
+			for _, item := range section.Items {
+				if keep(item) {
+					items = append(items, item)
+				}
+			}
+			if len(items) > 0 {
+				section.Items = items
+				visible = append(visible, section)
+			}
+		}
+		sections = visible
+	}
+	if r.id == routePlaylist && key.sort.ordered() {
+		sections = sortPlaylistSections(sections, key.sort)
+	}
+	if r.id == routePlaylist {
+		hasTracks := false
+		for _, section := range sections {
+			for _, item := range section.Items {
+				hasTracks = hasTracks || item.IsTrack()
+			}
+		}
+		if hasTracks {
+			rows = append(rows, row{kind: rowHeading, title: "Songs", shelf: "playlist-sort-header", track: -1})
+		}
+	}
+	vertical := collection || r.id == routeSearch || r.id == routeDownloads
+	// A playlist narrowed to a search shows only the songs that match, and
+	// the queue it gathers is still the whole playlist: playing a match
+	// plays the playlist from that song's own place in it.
+	searching := r.id == routePlaylist && key.filter != ""
+	needle := strings.ToLower(strings.TrimSpace(key.filter))
+	// placed says whether the library has led with its tile yet.
+	placed := false
+	for index, section := range sections {
+		if len(section.Items) == 0 {
+			continue
+		}
+		shelf := key.path + "#" + strconv.Itoa(index)
+		shown := section.Items
+		var places []int // where each shown song sits in playable, when searching
+		if searching {
+			// Every song of the playlist goes into the queue, whether or not
+			// the search shows it.
+			shown = make([]youtube.MusicItem, 0, len(section.Items))
+			for _, item := range section.Items {
+				if !item.IsTrack() {
+					continue
+				}
+				if matchesSearch(item, needle) {
+					shown = append(shown, item)
+					places = append(places, len(playable))
+				}
+				playable = append(playable, item)
+			}
+			if len(shown) == 0 {
+				continue
+			}
+		}
+		songs := 0
+		for _, item := range shown {
+			if item.IsTrack() {
+				songs++
+			}
+		}
+		mostlySongs := songs*10 >= len(shown)*6
+		if section.Title != "" {
+			rows = append(rows, row{kind: rowHeading, title: section.Title, shelf: shelf, track: -1})
+		}
+		if vertical || (r.isDetail() && mostlySongs) {
+			for position, item := range shown {
+				rw := row{kind: rowTrack, shelf: shelf, item: item, track: -1, position: position}
+				if item.IsTrack() {
+					if searching {
+						// The song keeps its place in the whole playlist,
+						// which the queue already holds, even when the
+						// playlist lists the same video twice.
+						rw.track = places[position]
+					} else {
+						rw.track = len(playable)
+						playable = append(playable, item)
+					}
+					if item.Thumbnail == "" {
+						item.Thumbnail = fallback
+						rw.item = item
+					}
+				}
+				rows = append(rows, rw)
+			}
+			continue
+		}
+		var tracks []youtube.MusicItem
+		for _, item := range section.Items {
+			if item.IsTrack() {
+				tracks = append(tracks, item)
+			}
+		}
+		kind := rowCards
+		if mostlySongs && len(section.Items) >= 3 && section.Items[0].Duration != "" {
+			kind = rowColumns
+		}
+		items := section.Items
+		if r.grid && kind == rowCards {
+			kind = rowGrid
+		}
+		// The library leads with making a playlist, before the Liked Music
+		// that the rest of it usually starts with.
+		if r.id == routeLibrary && !placed && (kind == rowGrid || kind == rowCards) {
+			items = append([]youtube.MusicItem{newPlaylistItem}, items...)
+			placed = true
+		}
+		if kind == rowGrid {
+			// A grid is laid out a line to a row, so the list builds only the
+			// lines in view. Building the whole grid as one row put every card
+			// of a library, and a request for its artwork, in every frame.
+			perLine := max(key.columns, 1)
+			for start := 0; start < len(items); start += perLine {
+				line := items[start:min(start+perLine, len(items))]
+				rows = append(rows, row{kind: rowGrid, shelf: shelf, items: line, queue: tracks, track: -1, position: start})
+			}
+			continue
+		}
+		rows = append(rows, row{kind: kind, shelf: shelf, items: items, queue: tracks, track: -1})
+	}
+	if s.partial {
+		rows = append(rows, row{kind: rowStreaming, track: -1})
+	}
+	// A playlist page shows what YouTube suggests under it after its own
+	// songs, a few at a time, under a heading of its own.
+	similar := s.similar
+	if exclude != nil {
+		similar = make([]youtube.MusicItem, 0, len(s.similar))
+		for _, item := range s.similar {
+			if keep(item) {
+				similar = append(similar, item)
+			}
+		}
+	}
+	if r.id == routePlaylist && len(similar) > 0 && key.filter == "" {
+		rows = append(rows, row{kind: rowSimilar, title: "Similar songs", track: -1})
+		for i, item := range similar[:min(s.similarShown, len(similar))] {
+			rows = append(rows, row{kind: rowTrack, item: item, queue: similar, track: i})
+		}
+		if s.similarShown < len(similar) || s.similarMore != "" {
+			rows = append(rows, row{kind: rowMore, title: "Show more", shelf: "similar", track: -1})
+		}
+	}
+	// A search asks for the next part of its results itself, as its list
+	// reaches the end of what it has, the way YouTube Music does. Every other
+	// page keeps the button that asks.
+	switch {
+	case s.moreErr != "":
+		rows = append(rows, row{kind: rowMore, title: "Could not load more. Try again", track: -1})
+	case key.moreBusy || key.restBusy:
+		rows = append(rows, row{kind: rowStreaming, title: "more", track: -1})
+	case s.more != "" && r.id != routeSearch && r.id != routePlaylist:
+		rows = append(rows, row{kind: rowMore, title: "Show more", track: -1})
+	}
+	if len(rows) == 0 || (len(rows) == 1 && rows[0].kind == rowHero) ||
+		(searching && len(rows) == 2 && rows[0].kind == rowHero && rows[1].shelf == "playlist-sort-header") {
+		title, body := r.empty.title, r.empty.body
+		switch {
+		case hiddenAI:
+			title, body = "No non-AI tracks found", "YouTube marked every song here as made with AI, or the page has nothing else to show."
+		case r.id == routeSearch:
+			title, body = "No results for “"+key.submitted+"”", "Check the spelling, or try a different search."
+		case searching:
+			title, body = "No songs match “"+key.filter+"”", ""
+		}
+		rows = append(rows, row{kind: rowEmpty, title: title, body: body, track: -1})
+	}
+	return rows, playable
+}
+
+// matchesSearch says whether a song is one a playlist search names: its title
+// or its byline holds needle, which is the search in lower case.
+func matchesSearch(item youtube.MusicItem, needle string) bool {
+	if needle == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(item.Title), needle) ||
+		strings.Contains(strings.ToLower(item.Subtitle), needle)
+}

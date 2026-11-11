@@ -1,0 +1,515 @@
+name: Release
+
+# Push a tag such as desktop-v0.2.0 to build the app for every platform and
+# publish it as a GitHub release, with the signed update files the app's
+# updater reads (docs/updates.md). It is published with --latest=false
+# because the app finds the newest desktop-v release by its tag prefix, not
+# by GitHub's latest marker. GET /releases/latest can still return it: that
+# endpoint picks the newest non-draft, non-prerelease release regardless of
+# the flag, and that is fine. It builds only after a CI run already passed on
+# the tag's commit, so no release builds from unchecked code. Triggering
+# only on tags keeps these expensive platform builds off every branch push
+# and pull request. Run it by hand on a tag to retry after CI turns green,
+# or on a branch to build without publishing.
+on:
+  push:
+    tags: ["desktop-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # The pushed tag names the release. A manual run on a tag retries that
+  # release; a manual run on a branch builds without publishing.
+  #
+  # Only the repository owner starts this workflow. Write access is enough to
+  # push a desktop-v tag or to dispatch a manual run, and either one would
+  # build and publish with this repository's secrets: the updater signing key,
+  # the Last.fm key, and TAP_TOKEN. Every other job waits on this one, so one
+  # check covers them all. A fork carries this file but not the owner, so it
+  # refuses there too. triggering_actor is the user who re-ran the workflow,
+  # which actor alone would still report as the owner.
+  gate:
+    if: >-
+      github.repository_owner == 'elianiva' &&
+      github.actor == 'elianiva' &&
+      github.triggering_actor == 'elianiva'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      ytdlp: ${{ steps.ytdlp.outputs.version }}
+    steps:
+      # yt-dlp breaks whenever YouTube changes, so every release bundles the
+      # newest one. It is looked up once here, so all the platform builds
+      # get the same version even if yt-dlp publishes while they run.
+      - name: Find the latest yt-dlp release
+        id: ytdlp
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(gh api repos/yt-dlp/yt-dlp/releases/latest --jq .tag_name)"
+          test -n "$version" || { echo "No yt-dlp release found."; exit 1; }
+          echo "Bundling yt-dlp $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Resolve the tag and commit
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ github.ref_type }}" = "tag" ]; then
+              tag="${{ github.ref_name }}"
+              echo "Manual retry for $tag."
+            else
+              echo "Manual run on ${{ github.ref_name }}: building without publishing."
+              {
+                echo "tag="
+                echo "version=0.0.0"
+                echo "sha=${{ github.sha }}"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          case "$tag" in
+            desktop-v*) ;;
+            *) echo "Not a version tag: $tag"; exit 1 ;;
+          esac
+          {
+            echo "tag=$tag"
+            echo "version=${tag#desktop-v}"
+            echo "sha=${{ github.sha }}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.sha }}
+          fetch-depth: 0
+      - name: Confirm the tag points at the release commit
+        if: steps.resolve.outputs.tag != ''
+        run: |
+          test "$(git tag --points-at HEAD --list '${{ steps.resolve.outputs.tag }}')" = "${{ steps.resolve.outputs.tag }}" || {
+            echo "Tag ${{ steps.resolve.outputs.tag }} does not point at ${{ steps.resolve.outputs.sha }}."
+            exit 1
+          }
+      # The tag's commit already passed CI as a branch push (tag pushes
+      # skip CI), so wait for that CI run instead of rebuilding unchecked
+      # code. This polls because the tag can land before CI finishes.
+      - name: Wait for CI to pass on the release commit
+        if: steps.resolve.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          sha="${{ steps.resolve.outputs.sha }}"
+          echo "Waiting for a successful CI run on $sha..."
+          for i in $(seq 1 60); do
+            data="$(gh api "repos/$GH_REPO/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=20")"
+            if echo "$data" | jq -e '[.workflow_runs[] | select(.conclusion == "success")] | length > 0' >/dev/null; then
+              echo "CI passed on $sha."
+              exit 0
+            fi
+            if echo "$data" | jq -e '[.workflow_runs[] | select(.status != "completed")] | length > 0' >/dev/null; then
+              echo "Attempt $i: CI still running; waiting 60s..."
+            elif echo "$data" | jq -e '.workflow_runs | length == 0' >/dev/null; then
+              echo "Attempt $i: no CI run yet; waiting 60s..."
+            else
+              echo "CI did not pass on $sha; refusing to release."
+              exit 1
+            fi
+            sleep 60
+          done
+          echo "Timed out waiting for CI on $sha."
+          exit 1
+
+  version:
+    needs: gate
+    if: needs.gate.outputs.tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - name: Check the tag matches mygo.json
+        run: |
+          want="desktop-v$(jq -r .version mygo.json)"
+          test "${{ needs.gate.outputs.tag }}" = "$want" || {
+            echo "Tag ${{ needs.gate.outputs.tag }} does not match mygo.json version $want."
+            exit 1
+          }
+          echo "Version OK: ${{ needs.gate.outputs.version }}"
+
+  # Meiro ships a small ffmpeg built from source (scripts/build-ffmpeg.sh)
+  # instead of a full build. It builds apart from the app, and is cached by
+  # the script's contents, so a release only rebuilds it when it changes.
+  #
+  # This stays a C build outside Bazel: the Linux one has to run inside
+  # Alpine so the binary is static against musl, which is a container
+  # concern rather than a build-graph one, and the per-architecture results
+  # are exactly what the universal macOS app combines.
+  ffmpeg:
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, os: macos-latest }
+          - { platform: darwin-amd64, os: macos-latest }
+          - { platform: linux-amd64, os: ubuntu-latest }
+          - { platform: linux-arm64, os: ubuntu-24.04-arm }
+          # Cross-compiled on Linux with MinGW-w64.
+          - { platform: windows-amd64, os: ubuntu-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: actions/cache@v6
+        id: cache
+        with:
+          path: resources/${{ matrix.platform }}
+          key: ffmpeg-${{ matrix.platform }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+      # Linux builds inside Alpine, so the binary is static against musl and
+      # runs on any distribution, where a glibc build needs a recent one.
+      - name: Build ffmpeg in Alpine
+        if: startsWith(matrix.platform, 'linux-') && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euc '
+            apk add --no-cache bash build-base curl nasm openssl-dev openssl-libs-static pkgconf tar xz
+            scripts/build-ffmpeg.sh "${{ matrix.platform }}"
+            chown -R '"$(id -u):$(id -g)"' resources'
+      - name: Build ffmpeg with MinGW-w64
+        if: startsWith(matrix.platform, 'windows-') && steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 nasm xz-utils
+          scripts/build-ffmpeg.sh "${{ matrix.platform }}"
+      - name: Build ffmpeg
+        if: startsWith(matrix.platform, 'darwin-') && steps.cache.outputs.cache-hit != 'true'
+        run: scripts/build-ffmpeg.sh "${{ matrix.platform }}"
+      - name: Check the build
+        run: |
+          ffmpeg="resources/${{ matrix.platform }}/bin/ffmpeg"
+          if [ "${{ matrix.platform }}" = windows-amd64 ]; then ffmpeg="$ffmpeg.exe"; fi
+          ls -la "$ffmpeg"
+          # A Windows binary cannot run on this runner, and neither can the
+          # Intel macOS one built on Apple Silicon.
+          if [ "${{ matrix.platform }}" != darwin-amd64 ] && [ "${{ matrix.platform }}" != windows-amd64 ]; then
+            "$ffmpeg" -hide_banner -protocols | grep -x '  https'
+            "$ffmpeg" -hide_banner -decoders | grep -E ' (opus|aac) '
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffmpeg-${{ matrix.platform }}
+          path: resources/${{ matrix.platform }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  build:
+    # A tag build waits on version (tag matches mygo.json); a manual
+    # branch build skips version, so it always runs and never publishes.
+    needs: [gate, version, ffmpeg]
+    if: always() && needs.gate.result == 'success' && needs.ffmpeg.result == 'success' && (needs.version.result == 'success' || needs.version.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS ships one universal app for both processor architectures
+          # rather than one per architecture.
+          - { platform: darwin-universal, os: macos-latest, variant: full }
+          - { platform: linux-amd64, os: ubuntu-latest, variant: full }
+          - { platform: linux-arm64, os: ubuntu-latest, variant: full }
+          - { platform: windows-amd64, os: ubuntu-latest, variant: full }
+          - { platform: darwin-universal, os: macos-latest, variant: minimal }
+          - { platform: linux-amd64, os: ubuntu-latest, variant: minimal }
+          - { platform: linux-arm64, os: ubuntu-latest, variant: minimal }
+          - { platform: windows-amd64, os: ubuntu-latest, variant: minimal }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: bazel-contrib/setup-bazel@0.19.1
+        with:
+          bazelisk-cache: true
+          repository-cache: true
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # The tag is the version: desktop-v1.2.3 builds as 1.2.3.
+      - name: Set the version
+        run: |
+          version="${{ needs.gate.outputs.version }}"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          jq --arg v "$version" '.version = $v' mygo.json > mygo.json.new
+          mv mygo.json.new mygo.json
+
+      # A minimal build updates to minimal builds. The feed MyGo bakes in
+      # is named only by the platform, so the same prefix would hand the
+      # full app to minimal installs. Their update files go to a release of
+      # their own, tagged desktop-minimal-v<version>.
+      - name: Point the minimal build at its own updates
+        if: matrix.variant == 'minimal'
+        run: |
+          jq '.updates.tagPrefix = "desktop-minimal-v"' mygo.json > mygo.json.new
+          mv mygo.json.new mygo.json
+
+      - name: Check the update signing key
+        if: needs.gate.outputs.tag != ''
+        env:
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+        run: |
+          test -n "$MYGO_UPDATER_PRIVATE_KEY" || {
+            echo "The MYGO_UPDATER_PRIVATE_KEY secret is not set; refusing to release without signed updates."
+            exit 1
+          }
+
+      - name: Check the Last.fm application key
+        if: needs.gate.outputs.tag != ''
+        env:
+          MEIRO_LASTFM_API_KEY: ${{ secrets.MEIRO_LASTFM_API_KEY }}
+          MEIRO_LASTFM_SECRET: ${{ secrets.MEIRO_LASTFM_SECRET }}
+        run: |
+          if [ -z "$MEIRO_LASTFM_API_KEY" ] || [ -z "$MEIRO_LASTFM_SECRET" ]; then
+            echo "The MEIRO_LASTFM_API_KEY and MEIRO_LASTFM_SECRET secrets are not both set; refusing to release an app that cannot connect to Last.fm."
+            exit 1
+          fi
+
+      # A universal macOS app is combined from both architecture directories,
+      # so it takes both halves of the ffmpeg build.
+      - uses: actions/download-artifact@v8
+        if: matrix.variant == 'full' && matrix.platform == 'darwin-universal'
+        with:
+          name: ffmpeg-darwin-arm64
+          path: resources/darwin-arm64
+      - uses: actions/download-artifact@v8
+        if: matrix.variant == 'full' && matrix.platform == 'darwin-universal'
+        with:
+          name: ffmpeg-darwin-amd64
+          path: resources/darwin-amd64
+      # Only the full build downloads the ffmpeg artifact; minimal resolves
+      # ffmpeg and yt-dlp from PATH at runtime.
+      - uses: actions/download-artifact@v8
+        if: matrix.variant == 'full' && matrix.platform != 'darwin-universal'
+        with:
+          name: ffmpeg-${{ matrix.platform }}
+          path: resources/${{ matrix.platform }}
+
+      # MyGo makes the Windows installer with NSIS, which Linux can run.
+      # It must be installed before the build, which skips the installer without it.
+      - name: Set up the Windows installer tool
+        if: startsWith(matrix.platform, 'windows-')
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nsis
+
+      - name: Build
+        if: matrix.variant == 'full'
+        env:
+          YT_DLP_VERSION: ${{ needs.gate.outputs.ytdlp }}
+          # Signs the update archives. Without the secret (a manual branch
+          # build) the build still runs, unsigned. GH_TOKEN lets MyGo read
+          # the published manifest to make delta updates.
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+          MEIRO_LASTFM_API_KEY: ${{ secrets.MEIRO_LASTFM_API_KEY }}
+          MEIRO_LASTFM_SECRET: ${{ secrets.MEIRO_LASTFM_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: bazel run //:dist -- --out dist "${{ matrix.platform }}"
+
+      - name: Build minimal
+        if: matrix.variant == 'minimal'
+        env:
+          MYGO_UPDATER_PRIVATE_KEY: ${{ secrets.MYGO_UPDATER_PRIVATE_KEY }}
+          MEIRO_LASTFM_API_KEY: ${{ secrets.MEIRO_LASTFM_API_KEY }}
+          MEIRO_LASTFM_SECRET: ${{ secrets.MEIRO_LASTFM_SECRET }}
+          GH_TOKEN: ${{ github.token }}
+        run: bazel run //:dist -- --out dist --minimal "${{ matrix.platform }}"
+
+      - name: Set up Linux package tools
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak imagemagick
+          sudo flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          for arch in x86_64 aarch64; do
+            sudo flatpak install --noninteractive --arch="$arch" flathub org.gnome.Platform//48 org.gnome.Sdk//48
+          done
+          go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.48.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          curl --fail --location --silent --show-error \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage \
+            --output "$RUNNER_TEMP/appimagetool"
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+
+      - name: Collect the downloads
+        run: |
+          mkdir artifacts
+          arch="${{ matrix.platform }}"; arch="${arch#*-}"
+          case "${{ matrix.platform }}" in
+            darwin-*)
+              dmg="$(find "dist/${{ matrix.platform }}" -maxdepth 1 -name '*.dmg')"
+              suffix=""
+              if [ "${{ matrix.variant }}" = minimal ]; then suffix=-minimal; fi
+              cp "$dmg" "artifacts/Meiro-${VERSION}-macos-${arch}${suffix}.dmg"
+              ;;
+            windows-*)
+              installer="$(find "dist/${{ matrix.platform }}" -maxdepth 1 -name '*-setup-*.exe')"
+              suffix=""
+              if [ "${{ matrix.variant }}" = minimal ]; then suffix=-minimal; fi
+              cp "$installer" "artifacts/Meiro-${VERSION}-windows-${arch}${suffix}-setup.exe"
+              if [ "${{ matrix.variant }}" = full ]; then
+                python3 - "dist/${{ matrix.platform }}" "artifacts/Meiro-${VERSION}-windows-${arch}-portable.zip" <<'PY'
+          from pathlib import Path
+          import sys
+          from zipfile import ZIP_DEFLATED, ZipFile
+
+          source = Path(sys.argv[1])
+          output = Path(sys.argv[2])
+          with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+              for path in sorted(source.rglob("*")):
+                  if path.is_dir():
+                      continue
+                  relative = path.relative_to(source)
+                  if relative.parent == Path(".") and (
+                      (relative.name.startswith("update-") and path.suffix == ".json")
+                      or path.suffix == ".delta"
+                      or path.name.endswith(".tar.gz")
+                      or ("-setup-" in relative.name and path.suffix == ".exe")
+                  ):
+                      continue
+                  archive.write(path, Path("Meiro") / relative)
+          PY
+              fi
+              ;;
+            linux-*)
+              scripts/package-linux.sh "${{ matrix.platform }}" "$VERSION" artifacts "${{ matrix.variant }}"
+              ;;
+          esac
+          # The signed update archive, deltas and manifest. The full
+          # build's go with its downloads; the minimal build's have the
+          # same names, so they stay apart for the release of their own.
+          # The archive keeps its name, which the manifest points at.
+          updates=artifacts
+          if [ "${{ matrix.variant }}" = minimal ]; then updates=minimal-updates; fi
+          mkdir -p "$updates"
+          find "dist/${{ matrix.platform }}" -maxdepth 1 -type f \
+            \( -name 'update-*.json' -o -name '*.delta' -o -name '*.tar.gz' \) -exec cp {} "$updates/" \;
+          ls -la artifacts "$updates"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: meiro-${{ matrix.platform }}-${{ matrix.variant }}
+          path: artifacts/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: matrix.variant == 'minimal'
+        with:
+          name: minimal-updates-${{ matrix.platform }}
+          path: minimal-updates/*
+          if-no-files-found: error
+
+  release:
+    # Publishing writes the release, so it repeats the owner check instead of
+    # trusting the gate alone: a later edit that lets a run past the gate
+    # still cannot publish.
+    if: >-
+      needs.gate.outputs.tag != '' &&
+      github.repository_owner == 'elianiva' &&
+      github.actor == 'elianiva' &&
+      github.triggering_actor == 'elianiva'
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # The release notes come from CHANGELOG.md.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: meiro-*
+          path: artifacts
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: minimal-updates-*
+          path: minimal-updates
+          merge-multiple: true
+      - name: Checksums
+        run: cd artifacts && sha256sum ./* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # --latest=false: the app finds desktop releases by their tag prefix.
+          version="${{ needs.gate.outputs.version }}"
+          # The notes are the version's CHANGELOG.md section, so the release
+          # says what the changelog says.
+          awk -v v="$version" '
+            /^## \[/ { on = index($0, "## [" v "]") == 1; next }
+            on' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for $version."; exit 1; }
+          {
+            echo "## Downloads"
+            echo
+            echo "- **macOS**: \`brew install --cask elianiva/tap/meiro\`, or the universal \`.dmg\` (Apple Silicon and Intel)."
+            echo "- **Windows** (\`amd64\`): the \`-portable.zip\` (extract and run \`Meiro.exe\`), or the \`-setup.exe\` installer. Untested: the author has no Windows machine."
+            echo "- **Linux** (\`amd64\`, \`arm64\`): \`.deb\`, \`.rpm\`, \`.flatpak\` (full build only), \`.AppImage\` or \`.tar.gz\`."
+            echo "- Full builds bundle ffmpeg and yt-dlp; \`minimal\` builds use the ones on your system."
+            echo "- Verify downloads with \`SHA256SUMS.txt\`."
+            echo
+            echo "## What's new"
+            cat notes.md
+            echo
+            echo "**Full changelog**: https://github.com/$GH_REPO/blob/${{ needs.gate.outputs.tag }}/CHANGELOG.md"
+          } > release-notes.md
+          gh release create "${{ needs.gate.outputs.tag }}" artifacts/* \
+            --title "Meiro $version" --notes-file release-notes.md --verify-tag --latest=false
+      # The minimal build's update files, apart from the downloads: its own
+      # release, published with --latest=false, tagged for its feed.
+      - name: Publish the minimal updates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${{ needs.gate.outputs.version }}"
+          gh release create "desktop-minimal-v$version" minimal-updates/* \
+            --title "Meiro $version minimal updates" \
+            --notes "Update files for the minimal builds of desktop-v$version. Download Meiro from that release." \
+            --target "${{ needs.gate.outputs.sha }}" --latest=false
+
+  # The Homebrew tap takes the new version as soon as it is published, so
+  # `brew install` offers it without waiting for the tap's daily check.
+  # repository_dispatch is how one repository's workflow reaches another: a
+  # workflow's own token only reaches its own repository, so this uses
+  # TAP_TOKEN, a fine-grained token for elianiva/homebrew-tap with contents
+  # write. Without the secret the tap still updates on its schedule.
+  tap:
+    needs: [gate, release]
+    # TAP_TOKEN writes to another repository, so this job repeats the owner
+    # check as well.
+    if: >-
+      needs.gate.outputs.tag != '' &&
+      github.repository_owner == 'elianiva' &&
+      github.actor == 'elianiva' &&
+      github.triggering_actor == 'elianiva'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the tap to take the new release
+        env:
+          GH_TOKEN: ${{ secrets.TAP_TOKEN }}
+          GH_REPO: elianiva/homebrew-tap
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "TAP_TOKEN is not set; elianiva/homebrew-tap updates on its own."
+            exit 0
+          fi
+          gh api --method POST "repos/$GH_REPO/dispatches" -f event_type=meiro-release

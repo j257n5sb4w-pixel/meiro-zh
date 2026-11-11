@@ -1,0 +1,46 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "youtube",
+    srcs = [
+        "accounts.go",
+        "ai.go",
+        "browse.go",
+        "client.go",
+        "cookie.go",
+        "credits.go",
+        "item.go",
+        "library.go",
+        "orderedjson.go",
+        "playback.go",
+        "playlists.go",
+        "rating.go",
+        "renderers.go",
+        "search.go",
+        "subscription.go",
+        "tracktabs.go",
+        "upnext.go",
+    ],
+    importpath = "github.com/elianiva/meiro/youtube",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "youtube_test",
+    srcs = [
+        "accounts_test.go",
+        "ai_test.go",
+        "cookie_test.go",
+        "credits_test.go",
+        "integration_test.go",
+        "library_test.go",
+        "lyrics_test.go",
+        "playback_test.go",
+        "playlists_test.go",
+        "rating_test.go",
+        "search_test.go",
+        "subscription_test.go",
+        "upnext_test.go",
+    ],
+    embed = [":youtube"],
+)

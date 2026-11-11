@@ -1,0 +1,25 @@
+/build/
+/dist/
+*.test
+/.mygo/
+mygo_windows_*.syso
+/.amp/portals/*
+/.amp/in/artifacts/
+/resources/darwin-*/
+/resources/linux-*/
+/resources/windows-*/
+/meiro
+/lastfmkeys_gen.go
+/bazel-*
+/zz_proof*_test.go
+
+# Local Cloudflare Workers state for the website.
+website/.wrangler/
+
+website/node_modules/
+
+# Build output of build.ps1 (this fork).
+/dist/
+/.gopath/
+/.gocache/
+/.gotmp/

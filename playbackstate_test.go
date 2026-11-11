@@ -1,0 +1,181 @@
+package main
+
+import (
+	"fmt"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/egoist/mygo/ui"
+
+	"github.com/elianiva/meiro/internal/playstate"
+	"github.com/elianiva/meiro/internal/settings"
+	"github.com/elianiva/meiro/youtube"
+)
+
+func TestRestoredQueueDropsUpcomingGeneratedVideos(t *testing.T) {
+	current := youtube.MusicItem{VideoID: "current", Title: "Current", Kind: youtube.KindTrack}
+	video := youtube.MusicItem{VideoID: "video", Title: "Music video", Kind: youtube.KindVideo}
+	track := youtube.MusicItem{VideoID: "track", Title: "Song", Kind: youtube.KindTrack}
+	var q queue
+	q.restore(playstate.State{Items: []youtube.MusicItem{current, video, track}, Index: 0, RecStart: 1})
+
+	if got := ids(q.items); fmt.Sprint(got) != "[current track]" {
+		t.Fatalf("restored upcoming queue = %v, want video removed", got)
+	}
+	if q.recStart != 1 {
+		t.Errorf("recommendation boundary = %d, want 1", q.recStart)
+	}
+	if _, exists := q.generated["video"]; exists {
+		t.Error("restored music video remains marked as generated")
+	}
+}
+
+func TestTheQueueComesBackPausedAfterARestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "playback.json")
+
+	first, _ := playbackApp(t)
+	first.playSave.writer.Path = path
+	first.saver.Path = filepath.Join(dir, "settings.json")
+	var q []youtube.MusicItem
+	for i := range 300 {
+		q = append(q, youtube.MusicItem{VideoID: fmt.Sprintf("v%d", i), Title: fmt.Sprintf("Track %d", i), Duration: "3:00"})
+	}
+	first.playFrom(q[0], q, 0, youtube.UpNextOptions{}, "My mix")
+	first.queue.insert(youtube.MusicItem{VideoID: "next-up", Title: "Next up"}, true, false)
+	first.setVolume(35)
+	first.saveSettings()
+	first.persistPlayback()
+	first.playSave.writer.Wait()
+	first.saver.Wait()
+
+	second, r := playbackApp(t)
+	second.settings = settings.Load(filepath.Join(dir, "settings.json"))
+	second.restorePlayback(path)
+
+	if second.settings.Volume != 35 {
+		t.Errorf("volume came back as %v", second.settings.Volume)
+	}
+	if n := second.queue.len(); n != len(q)+1 {
+		t.Errorf("%d tracks came back, want all %d playlist tracks and the queued track", n, len(q))
+	}
+	if second.current.VideoID != "v0" || second.queue.current().VideoID != "v0" {
+		t.Errorf("current track is %q", second.current.VideoID)
+	}
+	if got := second.queue.remaining(); got != len(q) {
+		t.Errorf("%d tracks left after restore, want %d", got, len(q))
+	}
+	if got := second.queue.at(second.queue.len() - 1).VideoID; got != "v299" {
+		t.Errorf("last playlist track is %q, want v299", got)
+	}
+	if next, ok := second.queue.next(false, repeatOff); !ok || second.queue.at(next).VideoID != "next-up" {
+		t.Errorf("the play-next track did not come first: %v", ids(second.queue.items[second.queue.index:min(second.queue.index+3, second.queue.len())]))
+	}
+	if second.queue.source != "My mix" || second.total != 3*time.Minute {
+		t.Errorf("source %q, total %v", second.queue.source, second.total)
+	}
+	if second.player.Active() || second.stream.busy() || r.asked("v0") {
+		t.Error("restoring started playing")
+	}
+
+	// Pressing play plays the restored track.
+	second.togglePlay()
+	if !r.asked("v0") || second.current.VideoID != "v0" {
+		t.Errorf("play did not start the restored track: %v", r.ids)
+	}
+}
+
+func TestPlaybackResumesWhereItWasLeft(t *testing.T) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg is not installed")
+	}
+	tone := filepath.Join(t.TempDir(), "tone.wav")
+	if out, err := exec.Command(ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=duration=30", tone).CombinedOutput(); err != nil {
+		t.Fatalf("making a tone: %v: %s", err, out)
+	}
+	path := filepath.Join(t.TempDir(), "playback.json")
+	q := []youtube.MusicItem{{VideoID: "a", Duration: "0:30"}, {VideoID: "b", Duration: "0:30"}}
+
+	first, r := playbackApp(t)
+	r.file = tone
+	first.playSave.writer.Path = path
+	first.play(q[1], q)
+	first.seek(12 * time.Second)
+	first.persistPlayback()
+	first.playSave.writer.Wait()
+
+	second, r := playbackApp(t)
+	r.file = tone
+	second.restorePlayback(path)
+	if got := second.scrub; got < 12 || got > 14 {
+		t.Fatalf("the slider restored at %vs, want about 12s", got)
+	}
+	second.togglePlay()
+	deadline := time.Now().Add(10 * time.Second)
+	for !second.player.Playing() && time.Now().Before(deadline) {
+		second.poll()
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !second.player.Playing() {
+		t.Fatal("the restored track did not play")
+	}
+	if got := second.player.Position(); got < 12*time.Second {
+		t.Errorf("playing from %v, want from 12s on", got)
+	}
+}
+
+func TestExitKeepsTheLastChangeWithoutWaitingOutTheDebounce(t *testing.T) {
+	a, _ := playbackApp(t)
+	path := filepath.Join(t.TempDir(), "playback.json")
+	a.playSave.writer.Path = path
+	q := tracks("a", "b", "c")
+	a.play(q[0], q)
+	a.persistPlayback() // handed to the debounced writer, not yet on disk
+	a.queue.insert(youtube.MusicItem{VideoID: "late"}, false, false)
+
+	start := time.Now()
+	a.savePlayback(0) // what shutdown does
+	a.playSave.writer.Wait()
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("flushing at exit took %v; it waited out the debounce", took)
+	}
+	if got := playstate.Load(path); fmt.Sprint(ids(got.Items)) != "[a b c late]" {
+		t.Errorf("the last change was lost: %v", ids(got.Items))
+	}
+}
+
+func TestARestartContinuesAnUnfinishedPlaylist(t *testing.T) {
+	resetFakes()
+	first, _ := playbackApp(t)
+	var songs []youtube.MusicItem
+	for i := range 100 {
+		songs = append(songs, youtube.MusicItem{VideoID: fmt.Sprintf("track-%d", i), Title: fmt.Sprintf("Track %d", i), Duration: "3:00"})
+	}
+	first.queue.replace(songs[0], songs, 0, "Large playlist")
+	first.queue.playlistMore = "playlist-tracks"
+	path := filepath.Join(t.TempDir(), "playback.json")
+	var writer playstate.Writer
+	writer.Path = path
+	writer.Save(first.queue.state(time.Second))
+	writer.Wait()
+
+	second, _ := playbackApp(t)
+	second.restorePlayback(path)
+	if second.player.Active() {
+		t.Fatal("restoring started playback")
+	}
+	tt := ui.NewTester(second.view, 1000, 700)
+	if err := tt.Click("Play"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if second.queue.len() != 146 || second.queue.remaining() != 145 || second.current.VideoID != "track-0" {
+		t.Fatalf("resumed playlist: current=%q queue=%d remaining=%d", second.current.VideoID, second.queue.len(), second.queue.remaining())
+	}
+	if second.queue.playlistMore != "" {
+		t.Fatal("completed playlist still has a pending continuation")
+	}
+}

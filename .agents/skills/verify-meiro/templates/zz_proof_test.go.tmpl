@@ -1,0 +1,22 @@
+package main
+
+import (
+	"testing"
+
+	"github.com/egoist/mygo/ui"
+)
+
+// Replace this scenario with the user flow being proved. prove.sh supplies
+// the shared recorder helpers and the repository's test harness.
+func TestProofFeature(t *testing.T) {
+	a := newTestApp(t)
+	a.router.Push("/search")
+	tt := ui.NewTester(a.view, 1000, 700)
+	p := newProof(t, tt)
+	p.step("search-page")
+
+	p.click(searchPlaceholder, "search-focused")
+	tt.Type("yor")
+	p.step("suggestions")
+	p.shows("Yorushika songs")
+}

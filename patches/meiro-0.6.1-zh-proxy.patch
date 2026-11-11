@@ -1,0 +1,1934 @@
+diff --git baseline/.gitignore meiro-master/.gitignore
+index 88d218b..c93ca12 100644
+--- baseline/.gitignore
++++ meiro-master/.gitignore
+@@ -17,3 +17,9 @@ mygo_windows_*.syso
+ website/.wrangler/
+ 
+ website/node_modules/
++
++# Build output of build.ps1 (this fork).
++/dist/
++/.gopath/
++/.gocache/
++/.gotmp/
+diff --git baseline/CHANGELOG.md meiro-master/CHANGELOG.md
+index 1ef5a8d..eff7e50 100644
+--- baseline/CHANGELOG.md
++++ meiro-master/CHANGELOG.md
+@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+ 
+ ### Added
+ 
++- **Meiro can go through a proxy.** Where Google is out of reach, a proxy address in the sign-in dialog carries the window that signs in and everything Meiro loads after it: YouTube Music, covers, lyrics, Last.fm, and the ffmpeg and yt-dlp it starts. Settings has the same field under System, with a button that checks the address against YouTube Music, and a Proxy chip in the top bar links back to it while one is set. Chromium-based sign-in windows and Firefox take the proxy too.
++- **The interface speaks Chinese.** A language switch in Settings picks the desktop's language, English, or Simplified Chinese. Everything Meiro draws is translated at the point it is drawn, so the same session switches between the two without a restart. YouTube Music is asked for its own sections in the same language, so "Music videos for you" comes back as 为你推荐的音乐视频.
+ - **The arrow keys walk the search suggestions.** While the search field shows suggestions, Down and Up highlight them in order, and Enter opens the highlighted one as a click would. Past either end the highlight goes back to the text typed, so Enter searches it. Typing clears the highlight, and Escape closes the suggestions and keeps the text.
+ - **Settings offers to support the project.** A new Ko-fi card under About and support has a button that opens the tip page in your browser.
+ 
+diff --git baseline/accountview.go meiro-master/accountview.go
+index 22181ac..e2e3173 100644
+--- baseline/accountview.go
++++ meiro-master/accountview.go
+@@ -5,6 +5,7 @@ import (
+ 
+ 	"github.com/egoist/mygo/ui"
+ 
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/m3"
+ 	"github.com/elianiva/meiro/youtube"
+ )
+@@ -14,7 +15,7 @@ import (
+ func (a *app) accountButton(c *ui.Context) {
+ 	sc := m3.Of(c).Scheme
+ 	button := ui.ButtonBase(c.Key("account"))
+-	button.Size(48, 48).Radius(m3.Full).Center().Cursor(ui.CursorPointer).Label("Account").Tooltip("Account")
++	button.Size(48, 48).Radius(m3.Full).Center().Cursor(ui.CursorPointer).Label("Account").Tooltip(lang.T("Account"))
+ 	if button.Hovered() || a.menuOpen {
+ 		button.Background(sc.OnSurface.Alpha(m3.StateHover))
+ 	}
+diff --git baseline/app.go meiro-master/app.go
+index 9ab7c42..0d92708 100644
+--- baseline/app.go
++++ meiro-master/app.go
+@@ -116,6 +116,9 @@ type app struct {
+ 	searchField, detailSearchField ui.Handle
+ 	// settingsSearch is the filter in the Settings top bar.
+ 	settingsSearch settingsSearchState
++	// settingsSearchPending is the filter to open Settings with, from a place
++	// that leads there, since going there closes the filter it had.
++	settingsSearchPending string
+ 	// writing holds the writes to a like, the library or a subscription that
+ 	// are out, by what they change, so that one is not asked for twice.
+ 	writing  map[string]bool
+@@ -173,6 +176,12 @@ type app struct {
+ 	cacheLimitError    string
+ 	cacheDirectoryText string
+ 	cacheDirError      string
++	// proxyText is the address in the proxy field, while the user edits it;
++	// proxyError is why it was not taken, and proxyCheck the reach of the
++	// address it was taken from.
++	proxyText  string
++	proxyError string
++	proxyCheck task
+ 	// report is the lookup of tool versions for a problem report, and
+ 	// reportError what went wrong opening it.
+ 	report      task
+diff --git baseline/internal/cookies/window.go meiro-master/internal/cookies/window.go
+index b3b8ecf..564ae30 100644
+--- baseline/internal/cookies/window.go
++++ meiro-master/internal/cookies/window.go
+@@ -5,6 +5,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"net"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"runtime"
+@@ -13,6 +14,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/elianiva/meiro/internal/proc"
++	"github.com/elianiva/meiro/internal/proxy"
+ )
+ 
+ // ErrNoBrowser reports that no browser the sign-in window can use is
+@@ -227,12 +229,47 @@ user_pref("browser.shell.checkDefaultBrowser", false);
+ user_pref("browser.startup.homepage_override.mstone", "ignore");
+ user_pref("network.cookie.db.maxWalBytes", 32768);
+ `
++	// Firefox does read the proxy environment variables, but writing them
++	// here too keeps the window on the proxy even when it is started
++	// through a Flatpak or snap wrapper that drops the environment.
++	if target := proxy.ServerArg(); target != "" {
++		prefs += fmt.Sprintf("user_pref(\"network.proxy.type\", 1);\nuser_pref(\"network.proxy.share_proxy_settings\", true);\nuser_pref(\"network.proxy.http\", %q);\nuser_pref(\"network.proxy.http_port\", %d);\nuser_pref(\"network.proxy.ssl\", %q);\nuser_pref(\"network.proxy.ssl_port\", %d);\n", proxyHost(target), proxyPort(target), proxyHost(target), proxyPort(target))
++	}
+ 	if kind == "zen" {
+ 		prefs += "user_pref(\"zen.welcome-screen.seen\", true);\n"
+ 	}
+ 	return os.WriteFile(filepath.Join(profile, "user.js"), []byte(prefs), 0o600)
+ }
+ 
++// proxyHost and proxyPort split a proxy address for Firefox's preferences,
++// which name the host and the port apart. An address with no port gets the
++// default of its scheme.
++func proxyHost(address string) string {
++	u, err := url.Parse(address)
++	if err != nil {
++		return address
++	}
++	return u.Hostname()
++}
++
++func proxyPort(address string) int {
++	u, err := url.Parse(address)
++	if err != nil {
++		return 8080
++	}
++	if port, err := strconv.Atoi(u.Port()); err == nil {
++		return port
++	}
++	switch u.Scheme {
++	case "https":
++		return 443
++	case "socks5", "socks5h":
++		return 1080
++	default:
++		return 8080
++	}
++}
++
+ // cookieDatabaseModTime is the later modification time of a Firefox profile's
+ // cookie database and its write-ahead log. The zero time means the profile has
+ // neither yet.
+@@ -277,6 +314,12 @@ func chromiumWindowArgs(profile, url string) []string {
+ 		// page is told what a normal browser would say.
+ 		"--disable-blink-features=AutomationControlled",
+ 	}
++	// Chromium ignores the proxy environment variables the window inherits,
++	// so the proxy the user set has to be named here as well. Without it
++	// Google is as unreachable from this window as from the rest of the app.
++	if server := proxy.ServerArg(); server != "" {
++		args = append(args, "--proxy-server="+server)
++	}
+ 	switch runtime.GOOS {
+ 	case "linux":
+ 		args = append(args, "--password-store=basic")
+diff --git meiro-master/internal/lang/lang.go meiro-master/internal/lang/lang.go
+new file mode 100644
+index 0000000..3a086dd
+--- /dev/null
++++ meiro-master/internal/lang/lang.go
+@@ -0,0 +1,84 @@
++// Package lang shows Meiro's interface in the language the user picked.
++//
++// Text is translated where it is drawn, not where it is set: the same notice,
++// error or page title is written once and read back translated wherever it
++// appears, and a message built at runtime out of a prefix and a name, such as
++// "Added “x” to your library", is translated by its pieces.
++package lang
++
++import (
++	"os"
++	"strings"
++
++	"github.com/egoist/mygo"
++)
++
++// The languages the interface can show.
++const (
++	// Auto follows the language of the system.
++	Auto = "auto"
++	// English shows the interface as it is written.
++	English = "en"
++	// Chinese shows the interface in Simplified Chinese.
++	Chinese = "zh"
++)
++
++// name is the tag of the language on show, English or Chinese.
++var name = English
++
++// Set picks the language the interface shows. It takes Auto, English or
++// Chinese, and anything else means Auto. Auto reads the languages the system
++// prefers, and answers English when Meiro is not running with a window yet, as
++// in a test.
++func Set(language string) {
++	switch language {
++	case Chinese:
++		name = Chinese
++	case English:
++		name = English
++	default:
++		name = detect()
++	}
++}
++
++// Current is the tag of the language on show.
++func Current() string { return name }
++
++// Shown reports whether the interface shows Chinese.
++func Shown() bool { return name == Chinese }
++
++// detect is the language a fresh install starts in: the system's, when it is
++// Chinese, and English otherwise.
++func detect() string {
++	for _, entry := range []string{"MYGO_LOCALE", "LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"} {
++		if strings.HasPrefix(strings.ToLower(os.Getenv(entry)), "zh") {
++			return Chinese
++		}
++	}
++	if !mygo.App.IsReady() {
++		return English
++	}
++	for _, tag := range mygo.App.PreferredLanguages() {
++		if strings.HasPrefix(strings.ToLower(tag), "zh") {
++			return Chinese
++		}
++	}
++	return English
++}
++
++// HL is the language YouTube Music answers in, as hl takes it, so that the
++// titles it sends back are in the language the interface shows.
++func HL() string {
++	if name == Chinese {
++		return "zh-CN"
++	}
++	return "en"
++}
++
++// T is the text to show for s.
++func T(s string) string {
++	if name != Chinese || s == "" {
++		return s
++	}
++	return translate(s)
++}
+diff --git meiro-master/internal/lang/lang_test.go meiro-master/internal/lang/lang_test.go
+new file mode 100644
+index 0000000..2d5c390
+--- /dev/null
++++ meiro-master/internal/lang/lang_test.go
+@@ -0,0 +1,51 @@
++package lang
++
++import "testing"
++
++func TestTranslateWhole(t *testing.T) {
++	Set(Chinese)
++	cases := map[string]string{
++		"Settings":        "设置",
++		"Sign in":         "登录",
++		"Nothing playing": "未在播放",
++	}
++	for in, want := range cases {
++		if got := T(in); got != want {
++			t.Errorf("T(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestTranslateBuilt(t *testing.T) {
++	Set(Chinese)
++	cases := map[string]string{
++		"Added “Song” to your library":    "已添加“Song”保存到媒体库",
++		"Could not like “Song”: HTTP 403": "无法喜欢“Song”： HTTP 403",
++		"Removed 3 tracks from the queue": "已从队列中移除 3 首歌曲",
++		"Playing Song Name":               "正在播放 Song Name",
++		"3 plays are kept on this device, for the stats. Meiro keeps the latest 500.": "3 条播放记录保存在本设备，用于统计。Meiro 最多保留 500 条。",
++	}
++	for in, want := range cases {
++		if got := T(in); got != want {
++			t.Errorf("T(%q) = %q, want %q", in, got, want)
++		}
++	}
++}
++
++func TestEnglishPassesThrough(t *testing.T) {
++	Set(English)
++	if got := T("Settings"); got != "Settings" {
++		t.Errorf("T(Settings) = %q in English", got)
++	}
++	if got := T("Added “x”"); got != "Added “x”" {
++		t.Errorf("T changed a built message in English: %q", got)
++	}
++}
++
++func TestUnknownStaysEnglish(t *testing.T) {
++	Set(Chinese)
++	const name = "A song title that is not interface text"
++	if got := T(name); got != name {
++		t.Errorf("T(%q) = %q", name, got)
++	}
++}
+diff --git meiro-master/internal/lang/parts.go meiro-master/internal/lang/parts.go
+new file mode 100644
+index 0000000..1bfba74
+--- /dev/null
++++ meiro-master/internal/lang/parts.go
+@@ -0,0 +1,174 @@
++package lang
++
++import (
++	"regexp"
++	"sort"
++	"strings"
++	"unicode"
++	"unicode/utf8"
++)
++
++// part is a piece of a message the app assembles at runtime, as in
++// "Added “" + title + "” to “" + playlist, or "Could not " + err.
++type part struct {
++	en, zh string
++	// anywhere says the piece may be translated wherever it appears; a
++	// piece that opens with a word may only start a message, because the
++	// same words inside a song's title are that song's name.
++	anywhere bool
++}
++
++// parts is what messages built at runtime are translated by, longest first so
++// that "Added “" wins over "Added ".
++var parts = build()
++
++func build() []part {
++	table := []part{
++		{en: "Could not remove dislike from “", zh: "无法取消“"},
++		{en: "Remove dislike from ", zh: "取消不喜欢 "},
++		{en: "Could not unsubscribe from ", zh: "无法取消订阅 "},
++		{en: "Could not subscribe to ", zh: "无法订阅 "},
++		{en: "Could not download “", zh: "无法下载“"},
++		{en: "Could not create “", zh: "无法创建“"},
++		{en: "Could not switch to “", zh: "无法切换到“"},
++		{en: "Could not unlike “", zh: "无法取消喜欢“"},
++		{en: "Could not dislike “", zh: "无法标记为不喜欢“"},
++		{en: "Could not like “", zh: "无法喜欢“"},
++		{en: "Could not remove “", zh: "无法移除“"},
++		{en: "Could not add “", zh: "无法添加“"},
++		{en: "Could not open “", zh: "无法打开“"},
++		{en: "Could not restore your YouTube Music session: ", zh: "无法恢复你的 YouTube Music 会话："},
++		{en: " is not in the system credential store", zh: " 不在系统凭据存储中"},
++		{en: "Could not save ", zh: "无法保存 "},
++		{en: "Could not remove ", zh: "无法移除 "},
++		{en: "Could not delete ", zh: "无法删除 "},
++		{en: "Unsubscribed from ", zh: "已取消订阅 "},
++		{en: "Subscribed to ", zh: "已订阅 "},
++		{en: "Importing from ", zh: "从 "},
++		{en: " did not work. Paste the Cookie header instead.", zh: " 导入失败，请改为粘贴 Cookie 请求头。"},
++		{en: ". Meiro remembers your choice.", zh: "。Meiro 会记住你的选择。"},
++		{en: "”: YouTube did not name that channel.", zh: "”：YouTube 没有给出该频道的名称。"},
++		{en: "” is already in “", zh: "”已经在“"},
++		{en: "” from playlist: ", zh: "” 从播放列表中移除："},
++		{en: "” from playlist", zh: "” 从播放列表中移除"},
++		{en: "” to your library", zh: "”保存到媒体库"},
++		{en: " from your library", zh: " 从媒体库移除"},
++		{en: " to your library", zh: " 保存到媒体库"},
++		{en: "” to “", zh: "”到“"},
++		{en: "”: ", zh: "”： "},
++		{en: "Added “", zh: "已添加“"},
++		{en: "Created “", zh: "已创建“"},
++		{en: "Deleted “", zh: "已删除“"},
++		{en: "Removed “", zh: "已移除“"},
++		{en: "It will hold “", zh: "它将包含“"},
++		{en: "Skipped ", zh: "已跳过 "},
++		{en: ": YouTube marks it as made with AI", zh: "：YouTube 将其标记为 AI 生成"},
++		{en: " will play next", zh: " 将在接下来播放"},
++		{en: " to the queue", zh: " 到队列"},
++		{en: " from the queue", zh: " 从队列中移除"},
++		{en: "Playing ", zh: "正在播放 "},
++		{en: "Downloading ", zh: "正在下载 "},
++		{en: "Added ", zh: "已添加 "},
++		{en: "Saved ", zh: "已保存 "},
++		{en: "Removed ", zh: "已移除 "},
++		{en: "Add to ", zh: "添加到 "},
++		{en: "More options for ", zh: "更多选项："},
++		{en: "Go to album: ", zh: "前往专辑："},
++		{en: "Go to artist: ", zh: "前往歌手："},
++		{en: "Playback speed: ", zh: "播放速度："},
++		{en: "Play ", zh: "播放 "},
++		{en: "Like ", zh: "喜欢 "},
++		{en: "Unlike ", zh: "取消喜欢 "},
++		{en: "Dislike ", zh: "标记为不喜欢 "},
++		{en: "Remove ", zh: "移除 "},
++		{en: " from playback indicator", zh: "（来自播放指示器）"},
++		{en: " is already ", zh: " 已被占用"},
++		{en: " waiting to be sent.", zh: " 条等待发送。"},
++		{en: " days", zh: " 天"},
++		{en: " plays", zh: " 次播放"},
++		{en: " play", zh: " 次播放"},
++	}
++	for i := range table {
++		first, _ := utf8.DecodeRuneInString(table[i].en)
++		table[i].anywhere = !unicode.IsLetter(first)
++	}
++	sort.SliceStable(table, func(i, j int) bool { return len(table[i].en) > len(table[j].en) })
++	return table
++}
++
++// patterns are the messages that carry a number, which no table of whole
++// strings can hold.
++var patterns = []struct {
++	re   *regexp.Regexp
++	text string
++}{
++	{regexp.MustCompile(`^(\d+) plays are kept on this device, for the stats\. Meiro keeps the latest (\d+)\.$`), "$1 条播放记录保存在本设备，用于统计。Meiro 最多保留 $2 条。"},
++	{regexp.MustCompile(`^Removed (\d+) tracks from the queue$`), "已从队列中移除 $1 首歌曲"},
++	{regexp.MustCompile(`^Something went wrong while (.+)\. The details are in the log\. Copying them helps when you report the problem\.$`), "处理$1时出错。详情在日志里，复制它有助于你报告问题。"},
++	{regexp.MustCompile(`^Songs you listen to in Meiro are counted here, for the last (\d+) days\.$`), "Meiro 中播放的歌曲会在这里统计，范围为最近 $1 天。"},
++	{regexp.MustCompile(`^Songs and covers load through (.+)\.$`), "歌曲和封面通过 $1 加载。"},
++}
++
++// translate builds the Chinese for s out of the whole-string table, the
++// number patterns, and the pieces of messages built at runtime.
++func translate(s string) string {
++	if translated, ok := words[s]; ok {
++		return translated
++	}
++	for _, pattern := range patterns {
++		if pattern.re.MatchString(s) {
++			return pattern.re.ReplaceAllString(s, pattern.text)
++		}
++	}
++	var b strings.Builder
++	for i := 0; i < len(s); {
++		matched := false
++		for _, p := range parts {
++			if !p.anywhere && i > 0 {
++				continue
++			}
++			if !strings.HasPrefix(s[i:], p.en) {
++				continue
++			}
++			// A piece that ends in a word may not cut one in half, as " play"
++			// would inside "playing", and one that starts with a word may not
++			// begin inside another.
++			if wholeWord(s, i, len(p.en)) {
++				b.WriteString(p.zh)
++				i += len(p.en)
++				matched = true
++				break
++			}
++		}
++		if matched {
++			continue
++		}
++		_, size := utf8.DecodeRuneInString(s[i:])
++		b.WriteString(s[i : i+size])
++		i += size
++	}
++	return b.String()
++}
++
++// wholeWord reports whether the match of n bytes at i in s starts and ends on a
++// word boundary, considering only the sides the piece itself touches.
++func wholeWord(s string, i, n int) bool {
++	start := s[i : i+n]
++	first, _ := utf8.DecodeRuneInString(start)
++	last, _ := utf8.DecodeLastRuneInString(start)
++	if i > 0 && isLetter(first) {
++		before, _ := utf8.DecodeLastRuneInString(s[:i])
++		if isLetter(before) {
++			return false
++		}
++	}
++	if rest := s[i+n:]; rest != "" && isLetter(last) {
++		after, _ := utf8.DecodeRuneInString(rest)
++		if isLetter(after) {
++			return false
++		}
++	}
++	return true
++}
++
++func isLetter(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+diff --git meiro-master/internal/lang/zh.go meiro-master/internal/lang/zh.go
+new file mode 100644
+index 0000000..7c3a3b8
+--- /dev/null
++++ meiro-master/internal/lang/zh.go
+@@ -0,0 +1,459 @@
++package lang
++
++// words is every interface string that is shown whole, in English, and what it
++// says in Simplified Chinese. A string not listed shows in English.
++var words = map[string]string{
++	// Sign-in
++	"Sign in to YouTube Music":      "登录 YouTube Music",
++	"Sign in":                       "登录",
++	"Sign out":                      "退出登录",
++	"Signed in":                     "已登录",
++	"Not signed in":                 "未登录",
++	"Sign in with a browser window": "使用浏览器窗口登录",
++	"Advanced":                      "高级",
++	"Cookie header":                 "Cookie 请求头",
++	"Paste the Cookie header":       "粘贴 Cookie 请求头",
++	"Import from a browser":         "从浏览器导入",
++	"Choose your YouTube account":   "选择你的 YouTube 账户",
++	"Choose the account or channel to use from ": "选择要使用的账户或频道，来源：",
++	"Meiro opens a separate browser window where you sign in to your Google account. Meiro never sees your password. It keeps the session of that window, which gives it the same account access as a browser, and closes the window. Your own browser is not used.": "Meiro 会打开一个独立的浏览器窗口，请在那里登录你的 Google 账户。Meiro 永远不会看到你的密码。它会保留该窗口的会话，权限与浏览器相同，然后关闭该窗口，不会动你自己的浏览器。",
++	"Finish signing in in the window that opened. Meiro closes it for you.":                                                         "请在弹出的窗口中完成登录，Meiro 会帮你关闭它。",
++	"Or use a browser you are already signed in with. This copy can stop working when that browser renews its cookies. Sign in at ": "或者使用一个你已经登录的浏览器。当该浏览器更新 Cookie 后，这份副本可能失效。请先在那里登录：",
++	" there first, then pick it:":                     "，然后再选择它：",
++	" did not work. Paste the Cookie header instead.": " 导入失败，请改为粘贴 Cookie 请求头。",
++	"To paste it: open music.youtube.com while signed in, open your browser's developer tools (F12) and go to the Network tab, reload, pick a request to music.youtube.com, and copy the value of its Cookie request header.": "粘贴方法：在已登录状态下打开 music.youtube.com，打开浏览器的开发者工具（F12）并切换到“网络”标签，刷新页面，选择任意一个发往 music.youtube.com 的请求，复制其 Cookie 请求头的值。",
++	"Meiro saves the session in a file in its data folder that only your user can read. Sign out to remove Meiro's saved copy.":                                                                                               "Meiro 会把会话保存在数据文件夹中一个只有你的用户能读取的文件里。退出登录即可删除 Meiro 保存的副本。",
++	"That is not the cookie of a signed-in session: it has no SAPISID. Copy the whole value of the Cookie header.":                                                                                                            "这不是一个已登录会话的 Cookie：其中缺少 SAPISID。请复制整个 Cookie 请求头的值。",
++	"To open your browser, Meiro needs permission to start programs outside its Flatpak sandbox. Run this command, then restart Meiro:":                                                                                       "为了打开你的浏览器，Meiro 需要在其 Flatpak 沙盒之外启动程序的权限。请运行下面的命令，然后重启 Meiro：",
++	"Copy command":                       "复制命令",
++	"Command copied":                     "命令已复制",
++	"Back":                               "返回",
++	"Cancel":                             "取消",
++	"Continue":                           "继续",
++	"Close":                              "关闭",
++	"Keep":                               "保留",
++	"Retry":                              "重试",
++	"Try another search.":                "试试其他关键词。",
++	"Check your connection, then retry.": "请检查网络连接后重试。",
++	"You are offline":                    "你已离线",
++	"Not found":                          "未找到",
++	"That page does not exist.":          "该页面不存在。",
++	"Could not load this page":           "无法加载此页面",
++	"Could not load more. Try again":     "无法加载更多，请重试。",
++	"Loading":                            "加载中",
++	"Looking up…":                        "查询中…",
++	"Dismiss":                            "关闭",
++	"Video":                              "视频",
++	"Delete":                             "删除",
++	"Create":                             "创建",
++	"Name":                               "名称",
++	"Next":                               "下一个",
++	"Previous":                           "上一个",
++	"Play":                               "播放",
++	"Play next":                          "下一首播放",
++	"Mute":                               "静音",
++	"Quit":                               "退出",
++	"Keep running":                       "保持运行",
++	"Close Meiro":                        "关闭 Meiro",
++	"Open Meiro":                         "打开 Meiro",
++	"Minimize to tray":                   "最小化到托盘",
++	"Keep running in background":         "在后台保持运行",
++	"Remember my choice":                 "记住我的选择",
++	"Open Now Playing":                   "打开正在播放",
++	"Open the player":                    "打开播放器",
++	"Close the player":                   "关闭播放器",
++
++	// Navigation and pages
++	"Home":                       "首页",
++	"Search":                     "搜索",
++	"Explore":                    "探索",
++	"Library":                    "媒体库",
++	"Downloads":                  "下载",
++	"Settings":                   "设置",
++	"Stats":                      "统计",
++	"Album":                      "专辑",
++	"Playlist":                   "播放列表",
++	"Artist":                     "歌手",
++	"Podcast":                    "播客",
++	"About":                      "关于",
++	"Up next":                    "接下来播放",
++	"Now playing":                "正在播放",
++	"Nothing playing":            "未在播放",
++	"Pick something in Meiro":    "在 Meiro 里选点东西吧",
++	"Nothing here yet":           "这里还什么都没有",
++	"Nothing to show yet":        "暂时没有内容",
++	"Nothing to explore yet":     "暂时没有可探索的内容",
++	"Your library is empty":      "你的媒体库是空的",
++	"Your library lives here":    "你的媒体库在这里",
++	"Your library":               "你的媒体库",
++	"No downloads yet":           "还没有下载",
++	"No plays yet":               "还没有播放记录",
++	"No results for “":           "没有找到“",
++	"No songs match “":           "没有匹配“",
++	"No settings found":          "没有找到设置项",
++	"The queue is empty":         "队列是空的",
++	"You have no playlists yet.": "你还没有播放列表。",
++	"No lyrics for this song.":   "这首歌没有歌词。",
++	"Synced lyrics unavailable":  "暂无同步歌词",
++	"Loading lyrics":             "正在加载歌词",
++	"Retry lyrics":               "重新加载歌词",
++	"Up late?":                   "还没睡？",
++	"Good morning":               "早上好",
++	"Good afternoon":             "下午好",
++	"Good evening":               "晚上好",
++	"Find your next favourite":   "找到你的下一首心头好",
++	"Recent searches":            "最近搜索",
++	"Clear search":               "清除搜索",
++	"Clear filters":              "清除筛选",
++	"Search results":             "搜索结果",
++	"Search songs, albums, artists, podcasts":                            "搜索歌曲、专辑、歌手、播客",
++	"Search for songs, albums, artists and playlists, then press Enter.": "搜索歌曲、专辑、歌手和播放列表，然后按回车。",
++	"Search in this playlist":                                            "在此播放列表中搜索",
++	"Search settings":                                                    "搜索设置",
++	"Pull to refresh":                                                    "下拉刷新",
++	"Show more":                                                          "显示更多",
++	"Check the spelling, or try a different search.":                     "请检查拼写，或换个关键词。",
++	"Songs, albums and playlists you save will show up here.":            "你保存的歌曲、专辑和播放列表会显示在这里。",
++	"Sign in to see your songs, albums and playlists.":                   "登录后即可查看你的歌曲、专辑和播放列表。",
++	"YouTube Music returned an empty home page.":                         "YouTube Music 返回了一个空白的首页。",
++	"YouTube Music returned an empty page.":                              "YouTube Music 返回了一个空白页面。",
++	"YouTube Music returned no songs for it.":                            "YouTube Music 没有返回其中的歌曲。",
++	"YouTube Music returned nothing for this artist.":                    "YouTube Music 没有返回这位歌手的内容。",
++	"YouTube Music returned no episodes for it.":                         "YouTube Music 没有返回该播客的节目。",
++	"This album is empty":                                                "这张专辑是空的",
++	"This playlist is empty":                                             "这个播放列表是空的",
++	"This podcast has no episodes":                                       "这个播客没有节目",
++	"Your session expired. Sign in again.":                               "会话已过期，请重新登录。",
++	"Could not restore your YouTube Music session: ":                     "无法恢复你的 YouTube Music 会话：",
++
++	// Player and track actions
++	"Playback speed":            "播放速度",
++	"Playback speed: ":          "播放速度：",
++	"Shuffle":                   "随机播放",
++	"Shuffle play":              "随机播放",
++	"Shuffle playlist":          "随机播放列表",
++	"Play playlist":             "播放播放列表",
++	"Start radio":               "开始电台",
++	"Add to queue":              "添加到队列",
++	"Clear queue":               "清空队列",
++	"Remove from queue":         "从队列中移除",
++	"Move up":                   "上移",
++	"Move down":                 "下移",
++	"Go to album":               "前往专辑",
++	"Go to artist":              "前往歌手",
++	"Open album":                "打开专辑",
++	"Open playlist":             "打开播放列表",
++	"Open podcast":              "打开播客",
++	"Copy link":                 "复制链接",
++	"Link copied":               "链接已复制",
++	"Add to playlist":           "添加到播放列表",
++	"Remove from playlist":      "从播放列表中移除",
++	"Remove from library":       "从媒体库中移除",
++	"Save to library":           "保存到媒体库",
++	"Remove download":           "移除下载",
++	"Delete playlist":           "删除播放列表",
++	"Playlist deleted":          "播放列表已删除",
++	"Playlist name":             "播放列表名称",
++	"New playlist":              "新建播放列表",
++	"This playlist":             "这个播放列表",
++	"This song":                 "这首歌",
++	"this artist":               "这位歌手",
++	"that channel":              "该频道",
++	"Like ":                     "喜欢 ",
++	"Unlike ":                   "取消喜欢 ",
++	"Dislike ":                  "不喜欢 ",
++	"Remove dislike":            "取消不喜欢",
++	"More options for ":         "更多选项：",
++	"Toggle auto-play":          "切换自动播放",
++	"Auto-play recommendations": "自动播放推荐",
++	"Add similar music when this queue ends.": "队列结束后继续添加相似歌曲。",
++	"Similar songs":                               "相似歌曲",
++	"Related songs aren't available.":             "暂无相关歌曲。",
++	"Related episodes aren't available.":          "暂无相关节目。",
++	"Recommendations aren't available right now.": "暂时无法获取推荐。",
++	"No related songs for this track.":            "这首歌没有相关歌曲。",
++	"Nothing related to this episode.":            "这一集没有相关内容。",
++	"Playing from":                                "播放来源",
++	"Source: ":                                    "来源：",
++	"Source: Better Lyrics":                       "来源：Better Lyrics",
++	"Source: YouTube Music":                       "来源：YouTube Music",
++	"Source: LRCLIB":                              "来源：LRCLIB",
++	"Where these lyrics come from":                "歌词来源",
++	"Meiro shows the lyrics of the first source that has them: Better Lyrics first, then YouTube Music, then LRCLIB.": "Meiro 会显示第一个有歌词的来源：优先 Better Lyrics，其次 YouTube Music，最后 LRCLIB。",
++	"Couldn't load lyrics. Try again in a moment.":                                                                    "无法加载歌词，请稍后再试。",
++	"Couldn't load the details. Try again in a moment.":                                                               "无法加载详情，请稍后再试。",
++	"Playback stopped because every remaining track is disliked":                                                      "剩余的歌曲都被标记为不喜欢，播放已停止",
++	"YouTube marks this song as made with AI.":                                                                        "YouTube 标记这首歌为 AI 生成。",
++	"No non-AI tracks found":                                                                                          "没有找到非 AI 生成的歌曲",
++	"YouTube marked every song here as made with AI, or the page has nothing else to show.":                           "YouTube 把这些歌曲都标记为 AI 生成，或者这个页面没有其他内容。",
++	"Unknown track":   "未知歌曲",
++	"Downloaded":      "已下载",
++	"Buffering":       "缓冲中",
++	"Sort ascending":  "升序排列",
++	"Sort descending": "降序排列",
++	"Sort: ":          "排序：",
++
++	// Settings
++	"Account":                    "账户",
++	"Appearance":                 "外观",
++	"Appearance and sound":       "外观与声音",
++	"Playback":                   "播放",
++	"Playback cache":             "播放缓存",
++	"Playback tools":             "播放工具",
++	"Sound":                      "声音",
++	"System":                     "系统",
++	"Desktop":                    "桌面",
++	"Keyboard":                   "键盘",
++	"Shortcuts":                  "快捷键",
++	"Storage and privacy":        "存储与隐私",
++	"About and support":          "关于与支持",
++	"Updates":                    "更新",
++	"Support":                    "支持",
++	"Listening stats":            "收听统计",
++	"Listening history":          "收听历史",
++	"Logs":                       "日志",
++	"Log files":                  "日志文件",
++	"Theme":                      "主题",
++	"Colour":                     "颜色",
++	"Colour source":              "颜色来源",
++	"Hue":                        "色相",
++	"Palette":                    "调色板",
++	"Zoom":                       "缩放",
++	"Zoom in":                    "放大",
++	"Zoom out":                   "缩小",
++	"Volume":                     "音量",
++	"Logarithmic volume":         "对数音量",
++	"Equaliser":                  "均衡器",
++	"Equaliser on":               "启用均衡器",
++	"Crossfade":                  "交叉淡入淡出",
++	"Crossfade on":               "启用交叉淡入淡出",
++	"Crossfade duration":         "淡入淡出时长",
++	"Fade between tracks":        "歌曲之间淡入淡出",
++	"Normalize loudness":         "响度标准化",
++	"Skip disliked songs":        "跳过不喜欢的歌曲",
++	"Auto-skip disliked songs":   "自动跳过不喜欢的歌曲",
++	"Skip AI-generated songs":    "跳过 AI 生成的歌曲",
++	"Exclude AI-generated songs": "排除 AI 生成的歌曲",
++	"AI-generated songs":         "AI 生成的歌曲",
++	"Songs":                      "歌曲",
++	"Albums and playlists":       "专辑与播放列表",
++	"Plays":                      "播放次数",
++	"Plays per day":              "每日播放次数",
++	"Most played":                "播放最多",
++	"Top artists":                "常听歌手",
++	"Plays per day, most played tracks and artists.": "每日播放次数、播放最多的歌曲和歌手。",
++	"From plays on this device.":                     "基于本设备的播放记录。",
++	"Artwork":                                        "封面",
++	"Cache folder":                                   "缓存文件夹",
++	"Choose cache folder":                            "选择缓存文件夹",
++	"Choose audio cache folder":                      "选择音频缓存文件夹",
++	"Default app cache folder":                       "应用默认缓存文件夹",
++	"Keep recent songs":                              "保留最近的歌曲",
++	"Songs to cache":                                 "缓存的歌曲数",
++	"Enter a whole number of 0 or more.":             "请输入 0 或更大的整数。",
++	"Enter any non-negative whole number and press Enter to apply. Set 0 to turn the cache off. Older songs are removed first; each is kept in the format YouTube serves it, in a private Meiro cache folder.": "输入任意非负整数并按回车生效。设为 0 可关闭缓存。较早的歌曲会先被移除；每首歌都以 YouTube 提供的格式保存在 Meiro 的私有缓存文件夹中。",
++	"Meiro creates a private ‘Meiro Audio Cache’ folder inside this location. Changing folders removes the songs Meiro cached in the old one.":                                                                 "Meiro 会在此位置创建一个私有的“Meiro Audio Cache”文件夹。更换文件夹会删除 Meiro 在旧文件夹中缓存的歌曲。",
++	"The saved folder is unavailable. Using the default cache location.": "保存的文件夹不可用，将使用默认缓存位置。",
++	"Light":        "浅色",
++	"Dark":         "深色",
++	"System theme": "跟随系统",
++	"Follow the desktop, or stay light or dark.":                                                                         "跟随桌面，或固定为浅色/深色。",
++	"Every colour in the app grows from this one.":                                                                       "应用中的每种颜色都由此色生成。",
++	"How boldly the colour is used.":                                                                                     "颜色的使用强度。",
++	"Make everything larger or smaller.":                                                                                 "把一切都放大或缩小。",
++	"Give the volume slider finer steps at low volumes.":                                                                 "让音量滑块在低音量时有更细的刻度。",
++	"Adjust track gain to keep songs at a more consistent volume. Requires a signed-in YouTube session.":                 "调整每首歌的增益，使音量更一致。需要已登录的 YouTube 会话。",
++	"Shape ten bands of the sound as you adjust them, without restarting the stream.":                                    "调整十个频段来塑造声音，无需重新开始播放。",
++	"Only songs known to be disliked are skipped.":                                                                       "只会跳过已知被标记为不喜欢的歌曲。",
++	"Skip songs YouTube marks as made with AI. Meiro checks before each song plays; unlabelled AI music may still play.": "跳过 YouTube 标记为 AI 生成的歌曲。Meiro 会在每首歌播放前检查；未标记的 AI 音乐仍可能播放。",
++	"Keep Meiro running in the tray, or quit it?":                                                                        "让 Meiro 继续在托盘运行，还是退出？",
++	"Keep Meiro running in the background, or quit it? Reopen the window from the Dock, notch or menu bar.":              "让 Meiro 在后台继续运行，还是退出？可从程序坞、刘海边栏或菜单栏重新打开窗口。",
++	"Closing the window keeps Meiro running in the tray instead of quitting.":                                            "关闭窗口时让 Meiro 在托盘继续运行，而不是退出。",
++	"Hide the window and keep Meiro running. Reopen it from the Dock, notch or menu bar.":                                "隐藏窗口并让 Meiro 继续运行。可从程序坞、刘海边栏或菜单栏重新打开。",
++	"Start Meiro when you log in.":                                                                                       "登录时启动 Meiro。",
++	"Open at login":                                                                                                      "登录时打开",
++	"Close to tray":                                                                                                      "关闭到托盘",
++	"Keep running when closed":                                                                                           "关闭后继续运行",
++	"Global shortcut":                                                                                                    "全局快捷键",
++	"Play or pause from anywhere with ":                                                                                  "在任何地方用此快捷键播放或暂停：",
++	"Choose a shortcut to change it. Hold ":                                                                              "选择一个快捷键来修改。按住 ",
++	" anywhere to see the key over each button.":                                                                         " 可在每个按钮上看到对应按键。",
++	"Press the new keys…":                                                                                                "按下新的按键…",
++	"Reset ":                                                                                                             "重置 ",
++	"Reset all":                                                                                                          "全部重置",
++	"Menu bar icon":                                                                                                      "菜单栏图标",
++	"Tray icon":                                                                                                          "托盘图标",
++	"Wordmark":                                                                                                           "文字标志",
++	"O mark":                                                                                                             "O 标志",
++	"Choose which icon appears in the system tray; the O mark is more subtle.":                                           "选择系统托盘显示的图标；“O”标志更低调。",
++	"Notch player":                                                                                                       "刘海边栏播放器",
++	"Notch panel":                                                                                                        "刘海边栏面板",
++	"Notch position":                                                                                                     "刘海边栏位置",
++	"Show notch player":                                                                                                  "显示刘海边栏播放器",
++	"Meiro Notch":                                                                                                        "Meiro 刘海边栏",
++	"Show album art and playback beside the MacBook notch. Turn off to use the menu bar mini player.": "在 MacBook 刘海旁显示封面和播放控制。关闭后使用菜单栏迷你播放器。",
++	"The menu bar mini player is active. Turn on to use the MacBook notch.":                           "菜单栏迷你播放器已启用。打开此选项可使用 MacBook 刘海。",
++	"The menu bar mini player is active until a display with a notch is available.":                   "在检测到带刘海的显示器之前，将使用菜单栏迷你播放器。",
++	"Open notch lyrics":  "打开刘海边栏歌词",
++	"Close notch lyrics": "关闭刘海边栏歌词",
++	"Keep Meiro in the menu bar with play, next and quit.":     "让 Meiro 常驻菜单栏，提供播放、下一首和退出。",
++	"Announce each new track. Clicking one brings Meiro back.": "每首新歌弹出通知，点击可切回 Meiro。",
++	"Track notifications":   "歌曲通知",
++	"Discord Rich Presence": "Discord 动态状态",
++	"Share the track, artist, cover and elapsed time while music plays. The status clears when playback pauses or stops.": "播放时共享歌曲、歌手、封面和已播放时长。暂停或停止播放时状态会被清除。",
++	"Position":                           "位置",
++	"Action":                             "操作",
++	"Check automatically":                "自动检查",
++	"Check for updates":                  "检查更新",
++	"Look for a new version once a day.": "每天检查一次新版本。",
++	"Install automatically":              "自动安装",
++	"Download in the background and switch at the next launch.": "在后台下载，下次启动时切换。",
++	"Signed releases install themselves.":                       "签名版本会自动安装。",
++	"This copy updates itself once it is installed from a signed release. Development builds and package installs update another way.": "从签名版本安装后，此副本会自动更新。开发版本和包管理器安装的版本以其他方式更新。",
++	"Last checked ": "上次检查：",
++	"Meiro is free, with no ads and no paid tier.": "Meiro 免费，没有广告，也没有付费版本。",
++	"Buy me a coffee":        "请我喝杯咖啡",
++	"Ko-fi":                  "Ko-fi",
++	"Open Ko-fi":             "打开 Ko-fi",
++	"Report a problem":       "报告问题",
++	"Something not working?": "有问题？",
++	"Open a new issue on GitHub with the Meiro, system, yt-dlp and ffmpeg versions filled in. Nothing about your account or listening is included.": "在 GitHub 上新建 issue，其中已填好 Meiro、系统、yt-dlp 和 ffmpeg 版本。不包含任何账户或收听信息。",
++	"Meiro keeps a log of what it does and what goes wrong, with no passwords or cookies in it.":                                                    "Meiro 会记录它的行为和出错情况，其中不含密码或 Cookie。",
++	"Meiro could not open its log file, so nothing is being logged.":                                                                                "Meiro 无法打开日志文件，因此不会记录任何内容。",
++	"Open logs folder":          "打开日志文件夹",
++	"Open logs":                 "打开日志",
++	"Meiro hit a problem":       "Meiro 遇到了问题",
++	"Copy details":              "复制详情",
++	"Details copied":            "详情已复制",
++	"yt-dlp may be out of date": "yt-dlp 可能已过期",
++	"You use the full build":    "你使用的是完整版",
++	"You use the minimal build": "你使用的是精简版",
++	"Open releases page":        "打开版发布页面",
++	"Decodes audio for playback. The full build includes it; the minimal build uses the version on PATH.":                                                                                              "用于解码音频播放。完整版自带，精简版使用 PATH 中的版本。",
++	"Finds the audio of each track. The full build includes it; the minimal build uses PATH and needs Node.js or Bun.":                                                                                 "用于查找每首歌的音频。完整版自带，精简版使用 PATH 中的版本，并需要 Node.js 或 Bun。",
++	"Meiro uses yt-dlp to find the audio of each track. YouTube changes often, and an old yt-dlp stops getting audio for some tracks. That is what “Requested format is not available” usually means.": "Meiro 使用 yt-dlp 查找每首歌的音频。YouTube 经常变化，旧版 yt-dlp 会逐渐无法获取部分歌曲的音频，通常表现为“Requested format is not available”。",
++	"It includes yt-dlp ": "自带 yt-dlp ",
++	"It uses yt-dlp ":     "使用 yt-dlp ",
++	" from your PATH. Update it yourself, for example with “yt-dlp -U” or your package manager. Or change to the full build, which includes the newest yt-dlp.": "（来自 PATH）。请自行更新，例如运行“yt-dlp -U”或使用包管理器。也可以改用完整版，它自带最新的 yt-dlp。",
++	". Every release of Meiro ships the newest yt-dlp, so install the latest release.":                                                                          "。Meiro 的每个版本都自带最新的 yt-dlp，请安装最新版本。",
++	"Learn more":                            "了解更多",
++	"Meiro":                                 "Meiro",
++	"Waiting for colors.json from matugen.": "正在等待 matugen 生成的 colors.json。",
++	"Waiting for approval":                  "等待批准",
++	"Approve Meiro on the Last.fm page that opened in your browser. Meiro connects as soon as you do, and never sees your Last.fm password.": "请在弹出的 Last.fm 页面中批准 Meiro。批准后 Meiro 会立即连接，且永远不会看到你的 Last.fm 密码。",
++	"Last.fm":                            "Last.fm",
++	"Last.fm needs you to connect again": "Last.fm 需要你重新连接",
++	"Last.fm no longer accepts this connection. Plays wait on this device until you reconnect.": "Last.fm 不再接受此连接。在你重新连接之前，播放记录会暂存在本设备。",
++	"Last.fm was not approved in time. Try connecting again.":                                   "Last.fm 未及时批准，请重新连接。",
++	"Last.fm did not connect: ": "Last.fm 未能连接：",
++	"Could not reach Last.fm: ": "无法访问 Last.fm：",
++	"Connect Last.fm":           "连接 Last.fm",
++	"Connect again":             "重新连接",
++	"Reconnect":                 "重新连接",
++	"Disconnect":                "断开连接",
++	"Scrobble plays":            "记录播放",
++	"Scrobbling":                "记录到 Last.fm",
++	"Scrobble to Last.fm":       "记录到 Last.fm",
++	"Turn off to pause scrobbling without disconnecting.":                                  "关闭后可在不断开连接的情况下暂停记录。",
++	"Send the tracks you listen to, and what is playing now, to your Last.fm profile.":     "把你收听的歌曲和当前正在播放的内容发送到你的 Last.fm 个人资料。",
++	"Plays are sent to Last.fm after you have listened to them for long enough.":           "歌曲听够一定时长后才会发送到 Last.fm。",
++	"This build of Meiro has no Last.fm application key, so it cannot connect to Last.fm.": "这个 Meiro 版本没有 Last.fm 应用密钥，因此无法连接到 Last.fm。",
++	"Meiro could not keep the Last.fm session safely, so it did not connect.":              "Meiro 无法安全保存 Last.fm 会话，因此没有连接。",
++	"Connected as ":            "已连接为 ",
++	"Connected to Last.fm as ": "已连接到 Last.fm，账户：",
++	"Disconnected, but Meiro could not delete the saved Last.fm session": "已断开连接，但 Meiro 无法删除已保存的 Last.fm 会话",
++	" %d waiting to be sent.": " 条等待发送。",
++	"%d plays are kept on this device, for the stats. Meiro keeps the latest %d.": "本设备保留了 %d 条播放记录用于统计，Meiro 最多保留 %d 条。",
++	"No plays are kept on this device.":                                           "本设备没有保留播放记录。",
++	"Delete all plays":                                                            "删除全部播放记录",
++	"Clear history":                                                               "清除历史",
++
++	// Notices
++	"Could not open the browser: ":                                                                             "无法打开浏览器：",
++	"Could not open the folder picker: ":                                                                       "无法打开文件夹选择器：",
++	"Could not open the logs folder: ":                                                                         "无法打开日志文件夹：",
++	"Could not open the releases page: ":                                                                       "无法打开发布页面：",
++	"Could not open Ko-fi: ":                                                                                   "无法打开 Ko-fi：",
++	"Could not use that folder: ":                                                                              "无法使用该文件夹：",
++	"Wait for sign-out to finish before signing in again.":                                                     "请等待退出登录完成后再重新登录。",
++	"The cancelled sign-in could not be removed from storage: ":                                                "已取消的登录无法从存储中删除：",
++	"Signed out, but the saved session could not be removed: ":                                                 "已退出登录，但无法删除已保存的会话：",
++	"Could not switch channel: ":                                                                               "无法切换频道：",
++	"Could not load the rest of the playlist: ":                                                                "无法加载播放列表的其余部分：",
++	"YouTube did not recognise the cookie as a signed-in session; it may have expired":                         "YouTube 未将该 Cookie 识别为已登录会话，它可能已过期",
++	"YouTube did not return any accounts; sign in at music.youtube.com in that browser, then try again":        "YouTube 没有返回任何账户；请先在浏览器中登录 music.youtube.com，然后重试",
++	"YouTube returned a different Google account than the one you selected; Meiro did not save the session":    "YouTube 返回的 Google 账户与你选择的不一致；Meiro 没有保存该会话",
++	"YouTube returned no email address for the selected Google account; Meiro could not verify your selection": "YouTube 没有返回所选 Google 账户的邮箱地址；Meiro 无法验证你的选择",
++	"Cleared the queue": "队列已清空",
++	"Saved ":            "已保存 ",
++	"Removed ":          "已移除 ",
++	"Added ":            "已添加 ",
++
++	// Proxy and language
++	"Network":                          "网络",
++	"Proxy":                            "代理",
++	"Proxy: ":                          "代理：",
++	"Language":                         "语言",
++	"Auto":                             "自动",
++	"English":                          "英语",
++	"Save":                             "保存",
++	"Test":                             "测试",
++	"Set a proxy address first.":       "请先填写代理地址。",
++	"The proxy reaches YouTube Music.": "代理可以访问 YouTube Music。",
++	"If Google is out of reach from this network, sign in through a proxy. The window that signs in and everything Meiro loads go through it. Leave it empty to go direct.":                                                                     "如果这个网络无法访问 Google，请通过代理登录。用于登录的窗口以及 Meiro 之后加载的所有内容都会走这个代理。留空则直连。",
++	"Send everything Meiro loads through a proxy: YouTube Music, covers, lyrics, Last.fm, and the ffmpeg and yt-dlp it starts. Write it as a browser does, like http://127.0.0.1:7890 or socks5://127.0.0.1:1080. Leave it empty to go direct.": "让 Meiro 加载的所有内容都走代理：YouTube Music、封面、歌词、Last.fm，以及它启动的 ffmpeg 和 yt-dlp。写法与浏览器相同，例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。留空则直连。",
++	"Songs and covers load through ": "歌曲和封面通过代理加载：",
++	"Follow the desktop, or pick one. Simplified Chinese is a translation; anything not translated stays in English.":       "跟随系统，或手动选择。简体中文为翻译版本，未翻译的内容仍显示英文。",
++	"Follow the desktop, or pick one. Simplified Chinese is a translation; anything not translated there stays in English.": "跟随系统，或手动选择。简体中文为翻译版本，其中未翻译的内容仍显示英文。",
++	"that is not a proxy address: the host is missing":                                                                      "这不是一个代理地址：缺少主机名",
++	"that is not a proxy address: leave the path off":                                                                       "这不是一个代理地址：请不要包含路径",
++
++	// The remaining screens: navigation, the settings that name a thing
++	// rather than a sentence, and the dialogs around them.
++	"Close the search":        "关闭搜索",
++	"Lyrics":                  "歌词",
++	"Related":                 "相关",
++	"Details":                 "详情",
++	"Back to the player menu": "返回播放器菜单",
++	"Expand navigation":       "展开侧边栏",
++	"Collapse navigation":     "收起侧边栏",
++	"Close Meiro?":            "关闭 Meiro？",
++	"Album cover":             "专辑封面",
++	"Account / channel":       "账户 / 频道",
++	"Playing music":           "正在播放音乐",
++	"Show stats":              "查看统计",
++	"Disliked songs":          "不喜欢的歌曲",
++	"Synced lyrics":           "同步歌词",
++	"Sync lyrics":             "同步歌词",
++	"Quick picks":             "快速精选",
++	"Earlier":                 "更早",
++	"Later":                   "稍后",
++	"Fixed":                   "固定",
++	"Interface language":      "界面语言",
++	"VIDEO":                   "视频",
++	"Sign in to see your library. Browsing and playing work without it.": "登录后即可查看你的媒体库。不登录也能浏览和播放。",
++	"Download songs, albums and playlists to play them offline.":         "下载歌曲、专辑和播放列表，以便离线播放。",
++	"Meiro makes it private to your account.":                            "Meiro 会将它设为你账户下的私享播放列表。",
++
++	// Colour palettes and equaliser presets, which are drawn as buttons.
++	"Tonal spot":         "色调点缀",
++	"Vibrant":            "鲜明",
++	"Expressive":         "表现力",
++	"Neutral":            "中性",
++	"Monochrome":         "单色",
++	"Calm and balanced":  "平静而均衡",
++	"Bold and tinted":    "浓烈而带色",
++	"Accents drift away": "点缀若隐若现",
++	"A trace of colour":  "一丝色彩",
++	"No colour at all":   "完全没有色彩",
++	"Flat":               "平直",
++	"Bass Boost":         "低音增强",
++	"Treble Boost":       "高音增强",
++	"Vocal":              "人声",
++	"Acoustic":           "原声",
++	"Pop":                "流行",
++	"Rock":               "摇滚",
++	"Jazz":               "爵士",
++	"Classical":          "古典",
++	"Electronic":         "电子",
++}
+diff --git baseline/internal/proc/proc.go meiro-master/internal/proc/proc.go
+index 2de9f09..7ac857d 100644
+--- baseline/internal/proc/proc.go
++++ meiro-master/internal/proc/proc.go
+@@ -15,6 +15,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/egoist/mygo"
++
++	"github.com/elianiva/meiro/internal/proxy"
+ )
+ 
+ // commandWaitDelay bounds how long a cancelled command may keep Wait blocked
+@@ -66,11 +68,13 @@ func bundledPath(name string) (string, bool) {
+ }
+ 
+ // Command builds an exec.Cmd whose cancellation kills the whole process tree
+-// and whose Wait cannot hang on inherited pipes.
++// and whose Wait cannot hang on inherited pipes. The command reaches the
++// network through the proxy the user set, if there is one.
+ func Command(ctx context.Context, name string, args ...string) *exec.Cmd {
+ 	cmd := exec.CommandContext(ctx, name, args...)
+ 	hardenCommand(cmd)
+ 	cmd.WaitDelay = commandWaitDelay
++	proxy.Apply(cmd)
+ 	return cmd
+ }
+ 
+diff --git meiro-master/internal/proxy/proxy.go meiro-master/internal/proxy/proxy.go
+new file mode 100644
+index 0000000..aaf46ee
+--- /dev/null
++++ meiro-master/internal/proxy/proxy.go
+@@ -0,0 +1,240 @@
++// Package proxy routes Meiro's network traffic through a proxy the user sets,
++// either in the sign-in window or in Settings.
++//
++// It covers every way the app reaches the network: Go's own HTTP clients (which
++// take their proxy from Proxy), the ffmpeg, yt-dlp and browser processes Meiro
++// starts (which read the HTTP_PROXY family from their environment), and the
++// sign-in browser window (which needs --proxy-server).
++package proxy
++
++import (
++	"fmt"
++	"net/http"
++	"net/url"
++	"os"
++	"os/exec"
++	"strings"
++	"sync"
++	"time"
++)
++
++const (
++	// checkURL is reached by Check: a host the app needs anyway, so a working
++	// answer means the rest of the app can reach YouTube too.
++	checkURL     = "https://music.youtube.com/"
++	checkTimeout = 15 * time.Second
++)
++
++// loopback never goes through the proxy: local artwork, the audio cache and the
++// loopback debugging port of the sign-in window all live there.
++var loopback = []string{"localhost", "127.0.0.1", "::1"}
++
++var (
++	mu      sync.RWMutex
++	address string
++	parsed  *url.URL
++)
++
++// Set records the proxy address, in any of the forms a user is likely to paste:
++// "127.0.0.1:7890", "http://127.0.0.1:7890", "socks5://127.0.0.1:1080". An
++// empty value turns the proxy off.
++func Set(value string) error {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		Clear()
++		return nil
++	}
++	target, err := parse(value)
++	if err != nil {
++		return err
++	}
++	mu.Lock()
++	address = value
++	parsed = target
++	mu.Unlock()
++	export(target)
++	return nil
++}
++
++// Clear turns the proxy off.
++func Clear() {
++	mu.Lock()
++	address = ""
++	parsed = nil
++	mu.Unlock()
++	unexport()
++}
++
++// Address reports the address the user set, empty when the proxy is off.
++func Address() string {
++	mu.RLock()
++	defer mu.RUnlock()
++	return address
++}
++
++// On reports whether a proxy is set.
++func On() bool { return Address() != "" }
++
++// Proxy decides where one request goes. It is the http.Transport hook, so it
++// runs on every connection.
++func Proxy(req *http.Request) (*url.URL, error) {
++	mu.RLock()
++	target := parsed
++	mu.RUnlock()
++	if target == nil {
++		return http.ProxyFromEnvironment(req)
++	}
++	if req != nil && req.URL != nil && isLoopback(req.URL.Hostname()) {
++		return nil, nil
++	}
++	return target, nil
++}
++
++// Transport builds an HTTP transport that uses the proxy. Callers keep their own
++// timeouts; only the proxy decision is shared.
++func Transport() *http.Transport {
++	base, ok := http.DefaultTransport.(*http.Transport)
++	if !ok {
++		base = &http.Transport{}
++	}
++	transport := base.Clone()
++	transport.Proxy = Proxy
++	return transport
++}
++
++// Install makes the default transport take the proxy, so every client that
++// keeps http.DefaultTransport follows it without being handed a transport of
++// its own: the audio cache, the lyrics and Last.fm clients, and the covers.
++func Install() {
++	http.DefaultTransport = Transport()
++}
++
++// Apply points a command at the proxy, so ffmpeg, yt-dlp and the browser Meiro
++// starts reach it too. It leaves the environment alone when the proxy is off.
++func Apply(cmd *exec.Cmd) {
++	if cmd == nil {
++		return
++	}
++	mu.RLock()
++	target := parsed
++	mu.RUnlock()
++	if target == nil {
++		return
++	}
++	env := cmd.Env
++	if env == nil {
++		env = os.Environ()
++	}
++	cmd.Env = withProxy(env, target)
++}
++
++// ServerArg is the value Chromium-based browsers want in --proxy-server.
++func ServerArg() string {
++	mu.RLock()
++	target := parsed
++	mu.RUnlock()
++	if target == nil {
++		return ""
++	}
++	return target.String()
++}
++
++// Check reaches checkURL through the proxy and reports what went wrong, so the
++// user learns whether an address works before signing in through it.
++func Check() error {
++	client := &http.Client{Transport: Transport(), Timeout: checkTimeout}
++	req, err := http.NewRequest(http.MethodHead, checkURL, nil)
++	if err != nil {
++		return err
++	}
++	resp, err := client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++	if resp.StatusCode >= http.StatusInternalServerError {
++		return fmt.Errorf("%s answered %s", checkURL, resp.Status)
++	}
++	return nil
++}
++
++func parse(value string) (*url.URL, error) {
++	text := value
++	if !strings.Contains(text, "://") {
++		text = "http://" + text
++	}
++	target, err := url.Parse(text)
++	if err != nil {
++		return nil, fmt.Errorf("that is not a proxy address: %w", err)
++	}
++	switch strings.ToLower(target.Scheme) {
++	case "http", "https", "socks5", "socks5h", "socks4":
++	default:
++		return nil, fmt.Errorf("%q is not a proxy type Meiro knows: use http, https or socks5", target.Scheme)
++	}
++	if target.Host == "" {
++		return nil, fmt.Errorf("that is not a proxy address: the host is missing")
++	}
++	if path := strings.TrimSuffix(target.Path, "/"); path != "" {
++		return nil, fmt.Errorf("that is not a proxy address: leave the path off")
++	}
++	target.Path = ""
++	return target, nil
++}
++
++func isLoopback(host string) bool {
++	host = strings.ToLower(strings.Trim(host, "[]"))
++	for _, name := range loopback {
++		if host == name {
++			return true
++		}
++	}
++	return false
++}
++
++// withProxy rewrites the proxy variables in env and keeps loopback direct.
++func withProxy(env []string, target *url.URL) []string {
++	value := target.String()
++	set := map[string]string{
++		"HTTP_PROXY":  value,
++		"HTTPS_PROXY": value,
++		"ALL_PROXY":   value,
++		"http_proxy":  value,
++		"https_proxy": value,
++		"all_proxy":   value,
++		"NO_PROXY":    strings.Join(loopback, ","),
++	}
++	out := make([]string, 0, len(env)+len(set))
++	for _, entry := range env {
++		name, _, ok := strings.Cut(entry, "=")
++		if !ok {
++			continue
++		}
++		if _, replaced := set[name]; replaced {
++			continue
++		}
++		out = append(out, entry)
++	}
++	for name, value := range set {
++		out = append(out, name+"="+value)
++	}
++	return out
++}
++
++// export mirrors the proxy into this process, so Go subprocesses and mygo's own
++// fetches follow it as well.
++func export(target *url.URL) {
++	for _, entry := range withProxy(os.Environ(), target) {
++		name, value, ok := strings.Cut(entry, "=")
++		if !ok {
++			continue
++		}
++		_ = os.Setenv(name, value)
++	}
++}
++
++func unexport() {
++	for _, name := range []string{"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy", "NO_PROXY", "no_proxy"} {
++		_ = os.Unsetenv(name)
++	}
++}
+diff --git baseline/internal/settings/settings.go meiro-master/internal/settings/settings.go
+index 06fca8b..6133441 100644
+--- baseline/internal/settings/settings.go
++++ meiro-master/internal/settings/settings.go
+@@ -121,6 +121,34 @@ type Settings struct {
+ 	// everything else does, 1 or 0 for their own pace.
+ 	PodcastSpeed float64 `json:"podcastSpeed,omitempty"`
+ 	MusicSpeed   float64 `json:"musicSpeed,omitempty"`
++	// Proxy is the proxy Meiro sends its traffic through, empty for a direct
++	// connection. It takes the forms a browser shows, such as
++	// "http://127.0.0.1:7890" or "socks5://127.0.0.1:1080".
++	Proxy string `json:"proxy,omitempty"`
++	// Language is the language of the interface: LanguageAuto follows the
++	// system, otherwise LanguageEnglish or LanguageChinese.
++	Language string `json:"language,omitempty"`
++}
++
++// The languages the interface offers.
++const (
++	// LanguageAuto follows the language of the system.
++	LanguageAuto = "auto"
++	// LanguageEnglish shows the interface in English.
++	LanguageEnglish = "en"
++	// LanguageChinese shows the interface in Simplified Chinese.
++	LanguageChinese = "zh"
++)
++
++// LanguageOrDefault reads the zero value of a settings file written before the
++// interface had a language as LanguageAuto.
++func LanguageOrDefault(language string) string {
++	switch language {
++	case LanguageEnglish, LanguageChinese:
++		return language
++	default:
++		return LanguageAuto
++	}
+ }
+ 
+ // TrayMark names one of the menu bar icon styles.
+diff --git baseline/lyrics.go meiro-master/lyrics.go
+index 12a7b42..a7d7687 100644
+--- baseline/lyrics.go
++++ meiro-master/lyrics.go
+@@ -9,6 +9,7 @@ import (
+ 
+ 	"github.com/egoist/mygo/ui"
+ 	"github.com/elianiva/meiro/internal/betterlyrics"
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/internal/lrclib"
+ 	"github.com/elianiva/meiro/internal/lyrics"
+ 	"github.com/elianiva/meiro/m3"
+@@ -223,7 +224,7 @@ func (a *app) lyricsModes(c *ui.Context, synced bool) {
+ 		// needs no words of its own.
+ 		ui.Icon(c, m3.IconSchedule).FontSize(18).TextColor(sc.OnSurfaceVariant)
+ 		on := synced
+-		if m3.CompactSwitch(c, &on, "Synced lyrics").Tooltip("Synced lyrics").Changed() {
++		if m3.CompactSwitch(c, &on, "Synced lyrics").Tooltip(lang.T("Synced lyrics")).Changed() {
+ 			a.settings.StaticLyrics = !on
+ 			if !a.settings.StaticLyrics {
+ 				// Back to the lines: the view finds the one being sung again
+diff --git baseline/m3/button.go meiro-master/m3/button.go
+index faaaee7..17093c4 100644
+--- baseline/m3/button.go
++++ meiro-master/m3/button.go
+@@ -2,6 +2,8 @@ package m3
+ 
+ import (
+ 	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/lang"
+ )
+ 
+ // ButtonKind is the emphasis of a button, from the loudest to the quietest.
+@@ -161,10 +163,11 @@ func buttonLabel(c *ui.Context, role Role, label string, emphasized bool, size f
+ 	if emphasized {
+ 		weight = role.Emphasis
+ 	}
+-	width, _ := c.MeasureText(0, ui.Span{Text: label, Size: size, Weight: weight, LetterSpacing: role.Tracking})
++	text := lang.T(label)
++	width, _ := c.MeasureText(0, ui.Span{Text: text, Size: size, Weight: weight, LetterSpacing: role.Tracking})
+ 	// A little extra minimum width prevents small differences between a
+ 	// platform's measured and rendered glyph widths from adding an ellipsis.
+-	return role.Style(ui.Text(c, label), emphasized).FontSize(size).MinWidth(width + 4)
++	return role.Style(ui.Text(c, text), emphasized).FontSize(size).MinWidth(width + 4)
+ }
+ 
+ // Button builds a button: its label and icon sit in a container whose shape,
+@@ -324,7 +327,7 @@ func IconButton(c *ui.Context, spec IconButtonSpec) ui.Element {
+ 		b.Size(side, side)
+ 	}
+ 	if spec.Label != "" {
+-		b.Label(spec.Label).Tooltip(spec.Label)
++		b.Label(spec.Label).Tooltip(lang.T(spec.Label))
+ 	}
+ 	if spec.Loading {
+ 		b.Disabled(true)
+diff --git baseline/m3/field.go meiro-master/m3/field.go
+index 11aac41..2f6fece 100644
+--- baseline/m3/field.go
++++ meiro-master/m3/field.go
+@@ -2,6 +2,8 @@ package m3
+ 
+ import (
+ 	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/lang"
+ )
+ 
+ // SearchSpec describes a search bar.
+@@ -101,7 +103,7 @@ func SearchBar(c *ui.Context, spec SearchSpec) (SearchResult, ui.Element) {
+ 		} else {
+ 			ui.Icon(c, IconSearch).FontSize(24).TextColor(sc.OnSurfaceVariant)
+ 		}
+-		input := ui.TextInputBase(c.Key("input"), spec.Value).Placeholder(spec.Placeholder).Label(spec.Placeholder).
++		input := ui.TextInputBase(c.Key("input"), spec.Value).Placeholder(lang.T(spec.Placeholder)).Label(spec.Placeholder).
+ 			Grow(1).MinWidth(0).FontSize(16).TextColor(sc.OnSurface).Padding(0, spec.TrailingPadding, 0, 0).FocusRing(false)
+ 		if spec.Focus != nil {
+ 			input.Bind(spec.Focus)
+diff --git baseline/m3/misc.go meiro-master/m3/misc.go
+index 399869b..cf193a6 100644
+--- baseline/m3/misc.go
++++ meiro-master/m3/misc.go
+@@ -6,6 +6,8 @@ import (
+ 	"unicode"
+ 
+ 	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/lang"
+ )
+ 
+ // pick returns yes when b is true, else no: a choice without a map lookup.
+@@ -135,16 +137,16 @@ func Snackbars(c *ui.Context, inset float32) {
+ 				if t.Type == "error" {
+ 					ui.Icon(c, IconError).FontSize(20).TextColor(sc.Error)
+ 				}
+-				BodyMedium.Style(ui.Text(c, t.Title), false).TextColor(sc.InverseOnSurface).Grow(1).MaxLines(2)
++				BodyMedium.Style(ui.Text(c, lang.T(t.Title)), false).TextColor(sc.InverseOnSurface).Grow(1).MaxLines(2)
+ 				if t.Action != "" {
+ 					action := toast.ActionButton().Padding(0, 12).Height(MinTarget).Radius(Full).Center().
+ 						Cursor(ui.CursorPointer).TextColor(sc.InversePrimary)
+ 					action.Background(StateFill(ui.Transparent, sc.InversePrimary, action.Hovered(), action.Pressed(), false))
+ 					action.Children(func() {
+-						LabelLarge.Style(ui.Text(c, t.Action), true).TextColor(sc.InversePrimary)
++						LabelLarge.Style(ui.Text(c, lang.T(t.Action)), true).TextColor(sc.InversePrimary)
+ 					})
+ 				}
+-				toast.CloseButton().Label("Dismiss").Size(40, 40).Radius(Full).Center().Cursor(ui.CursorPointer).
++				toast.CloseButton().Label(lang.T("Dismiss")).Size(40, 40).Radius(Full).Center().Cursor(ui.CursorPointer).
+ 					TextColor(sc.InverseOnSurface).Children(func() {
+ 					ui.Icon(c, IconClose).FontSize(20)
+ 				})
+@@ -175,6 +177,8 @@ func Menu(c *ui.Context, anchor ui.Element, open *bool, width float32, build fun
+ // MenuItem is one entry of a menu.
+ func MenuItem(c *ui.Context, label string, icon *ui.SVG) ui.Element {
+ 	sc := Of(c).Scheme
++	// The key and the accessible label stay in English: they identify the
++	// entry, and a test clicks it by the name the app was written with.
+ 	b := ui.ButtonBase(c.Key("menu-" + label))
+ 	b.Height(48).PaddingX(12).Gap(12).AlignItems(ui.Center).Radius(Medium).Cursor(ui.CursorPointer).Label(label).Role(ui.RoleMenuItem).
+ 		Background(StateFill(ui.Transparent, sc.OnSurface, b.Hovered(), b.Pressed(), b.FocusVisible()))
+@@ -182,7 +186,7 @@ func MenuItem(c *ui.Context, label string, icon *ui.SVG) ui.Element {
+ 		if icon != nil {
+ 			ui.Icon(c, icon).FontSize(24).TextColor(sc.OnSurfaceVariant)
+ 		}
+-		LabelLarge.Style(ui.Text(c, label), false).TextColor(sc.OnSurface).SingleLine().Grow(1).FontSize(15)
++		LabelLarge.Style(ui.Text(c, lang.T(label)), false).TextColor(sc.OnSurface).SingleLine().Grow(1).FontSize(15)
+ 	})
+ 	return b
+ }
+@@ -224,7 +228,7 @@ func VideoBadge(c *ui.Context, artSize float32) {
+ 	badge := ui.Box(c).Size(width, height).Attach(ui.AnchorTopLeft, ui.AnchorTopLeft).
+ 		Top(inset).Left(inset).Radius(Full).Background(sc.Scrim.Alpha(0.55)).Center().Label("Video")
+ 	badge.Children(func() {
+-		LabelSmall.Style(ui.Text(c, "VIDEO"), true).Width(width).FontSize(fontSize).FixedLineHeight(height).
++		LabelSmall.Style(ui.Text(c, lang.T("VIDEO")), true).Width(width).FontSize(fontSize).FixedLineHeight(height).
+ 			TextColor(ui.RGB(255, 255, 255)).TextAlign(ui.Center).SingleLine().Shrink(0)
+ 	})
+ }
+diff --git baseline/m3/nav.go meiro-master/m3/nav.go
+index 826255d..efae7dc 100644
+--- baseline/m3/nav.go
++++ meiro-master/m3/nav.go
+@@ -2,6 +2,8 @@ package m3
+ 
+ import (
+ 	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/lang"
+ )
+ 
+ // NavItem is a destination of a navigation rail.
+@@ -111,7 +113,7 @@ func railMenu(c *ui.Context, open float32, expanded bool) ui.Element {
+ 	sc := Of(c).Scheme
+ 	label := pick(expanded, "Collapse navigation", "Expand navigation")
+ 	b := ui.ButtonBase(c.Key("rail-menu"))
+-	b.Size(MinTarget, MinTarget).Center().Cursor(ui.CursorPointer).Label(label).Tooltip(label).Transition(Fade(EffectsFast))
++	b.Size(MinTarget, MinTarget).Center().Cursor(ui.CursorPointer).Label(label).Tooltip(lang.T(label)).Transition(Fade(EffectsFast))
+ 	b.Children(func() {
+ 		fill := StateFill(ui.Transparent, sc.OnSurfaceVariant, b.Hovered(), b.Pressed(), b.FocusVisible())
+ 		shape := ui.Box(c).Size(32, 32).Radius(16).Background(fill).Center()
+@@ -177,13 +179,13 @@ func navItem(c *ui.Context, item NavItem, selected, expanded bool, fade, railWid
+ 			label := ui.Box(c.Key("nav-label-" + item.ID)).Absolute().Top(18).Left(expandedLabelLeft).
+ 				Width(railWidth - expandedLabelLeft).Height(LabelLarge.Line).Opacity(fade)
+ 			label.Children(func() {
+-				LabelLarge.Style(ui.Text(c, item.Label), false).TextColor(labelColor).SingleLine()
++				LabelLarge.Style(ui.Text(c, lang.T(item.Label)), false).TextColor(labelColor).SingleLine()
+ 			})
+ 		} else {
+ 			label := ui.Box(c.Key("nav-label-" + item.ID)).Absolute().Top(42).Left(0).
+ 				Width(RailCollapsed).Height(LabelMedium.Line).Opacity(fade)
+ 			label.Children(func() {
+-				LabelMedium.Style(ui.Text(c, item.Label), selected).TextColor(labelColor).
++				LabelMedium.Style(ui.Text(c, lang.T(item.Label)), selected).TextColor(labelColor).
+ 					TextAlign(ui.Center).SingleLine()
+ 			})
+ 		}
+diff --git baseline/m3/theme.go meiro-master/m3/theme.go
+index 7c95622..310f931 100644
+--- baseline/m3/theme.go
++++ meiro-master/m3/theme.go
+@@ -17,6 +17,8 @@ import (
+ 	"sync"
+ 
+ 	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/lang"
+ )
+ 
+ // Mode says which appearance a theme takes.
+@@ -240,21 +242,31 @@ func (r Role) Style(e ui.Element, emphasized bool) ui.Element {
+ // Text shows text in a role of the type scale, in the colour of text on a
+ // surface.
+ func Text(c *ui.Context, r Role, s string) ui.Element {
+-	return r.Style(ui.Text(c, s), false).TextColor(Of(c).Scheme.OnSurface)
++	return r.Style(ui.Text(c, lang.T(s)), false).TextColor(Of(c).Scheme.OnSurface)
+ }
+ 
+ // EmphasizedText is Text in the role's emphasised weight.
+ func EmphasizedText(c *ui.Context, r Role, s string) ui.Element {
+-	return r.Style(ui.Text(c, s), true).TextColor(Of(c).Scheme.OnSurface)
++	return r.Style(ui.Text(c, lang.T(s)), true).TextColor(Of(c).Scheme.OnSurface)
+ }
+ 
+ // RichText shows text whose spans differ in style, in a role of the type
+ // scale, in the colour of text on a surface.
+ func RichText(c *ui.Context, r Role, spans ...ui.Span) ui.Element {
+-	return r.Style(ui.RichText(c, spans...), false).TextColor(Of(c).Scheme.OnSurface)
++	return r.Style(ui.RichText(c, translated(spans)...), false).TextColor(Of(c).Scheme.OnSurface)
+ }
+ 
+ // EmphasizedRichText is RichText in the role's emphasised weight.
+ func EmphasizedRichText(c *ui.Context, r Role, spans ...ui.Span) ui.Element {
+-	return r.Style(ui.RichText(c, spans...), true).TextColor(Of(c).Scheme.OnSurface)
++	return r.Style(ui.RichText(c, translated(spans)...), true).TextColor(Of(c).Scheme.OnSurface)
++}
++
++// translated is spans with their text in the language of the interface.
++func translated(spans []ui.Span) []ui.Span {
++	out := make([]ui.Span, len(spans))
++	for i, span := range spans {
++		span.Text = lang.T(span.Text)
++		out[i] = span
++	}
++	return out
+ }
+diff --git baseline/main.go meiro-master/main.go
+index db592b0..02fbd65 100644
+--- baseline/main.go
++++ meiro-master/main.go
+@@ -30,6 +30,7 @@ import (
+ 	"github.com/elianiva/meiro/internal/applog"
+ 	"github.com/elianiva/meiro/internal/audio"
+ 	"github.com/elianiva/meiro/internal/diskcache"
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/internal/memprof"
+ 	"github.com/elianiva/meiro/internal/proc"
+ 	"github.com/elianiva/meiro/internal/report"
+@@ -204,6 +205,8 @@ func (a *app) setup() {
+ 		a.account.signIn.err = err.Error()
+ 	}
+ 	a.cacheSongsText = strconv.Itoa(a.settings.CacheSongs)
++	a.applyProxy()
++	lang.Set(a.settings.Language)
+ 	a.volume = a.settings.Volume
+ 	a.player.SetVolume(playbackVolume(a.volume, 0, false, a.settings.LogVolume))
+ 	a.loadEQ()
+diff --git baseline/navigation.go meiro-master/navigation.go
+index 4a1bedd..bc5c877 100644
+--- baseline/navigation.go
++++ meiro-master/navigation.go
+@@ -140,6 +140,10 @@ func (a *app) onNavigate() {
+ 	a.detailFilter, a.detailSearchOpen, a.detailSearchHadFocus, a.detailSort, a.detailSortOpen = "", false, false, playlistSort{}, false
+ 	a.detailCompact = false
+ 	a.closeSettingsSearch()
++	if query := a.settingsSearchPending; query != "" {
++		a.settingsSearchPending = ""
++		a.settingsSearch = settingsSearchState{query: query, open: true}
++	}
+ 	a.pageLoad.stop()
+ 	a.pageMore.stop()
+ 	a.nowPlaying.open, a.nowPlaying.closing = false, false
+diff --git meiro-master/network.go meiro-master/network.go
+new file mode 100644
+index 0000000..0fe8633
+--- /dev/null
++++ meiro-master/network.go
+@@ -0,0 +1,136 @@
++package main
++
++// The proxy settings: where Meiro sends its traffic when YouTube is out of
++// reach, and the card that sets it. Google's sign-in and music.youtube.com
++// answer nothing on a network that cannot reach them, so the address has to
++// work before anything else can.
++
++import (
++	"context"
++	"strings"
++	"time"
++
++	"github.com/egoist/mygo/ui"
++
++	"github.com/elianiva/meiro/internal/proxy"
++	"github.com/elianiva/meiro/m3"
++)
++
++// applyProxy makes the saved proxy the one every client and child process
++// uses. It runs at startup and whenever the user saves another address.
++func (a *app) applyProxy() {
++	if err := proxy.Set(strings.TrimSpace(a.settings.Proxy)); err != nil {
++		// A file that names a proxy the app cannot read keeps the app going
++		// without one, and the fields show why once they are opened.
++		a.proxyError = err.Error()
++		return
++	}
++	proxy.Install()
++	a.proxyText = proxy.Address()
++	a.proxyError = ""
++}
++
++// setProxy takes the address in the field, and keeps it only when it reads.
++func (a *app) setProxy(value string) {
++	if err := proxy.Set(strings.TrimSpace(value)); err != nil {
++		a.proxyError = err.Error()
++		return
++	}
++	proxy.Install()
++	a.proxyError = ""
++	a.settings.Proxy = proxy.Address()
++	a.proxyText = proxy.Address()
++	a.saveSettings()
++	a.refresh()
++}
++
++// checkProxy asks the proxy for music.youtube.com off the main thread, so the
++// user learns whether an address works before signing in through it.
++func (a *app) checkProxy() {
++	if proxy.Address() == "" {
++		a.proxyError = "Set a proxy address first."
++		return
++	}
++	startTask(a, &a.proxyCheck, 30*time.Second, func(context.Context) (string, error) {
++		if err := proxy.Check(); err != nil {
++			return "", err
++		}
++		return "The proxy reaches YouTube Music.", nil
++	}, func(message string, err error) {
++		if err != nil {
++			a.proxyError = err.Error()
++		} else {
++			a.proxyError = ""
++			a.notice = message
++		}
++		a.refresh()
++	})
++}
++
++// proxyField is the proxy address and the buttons that save and test it. The
++// sign-in dialog and the settings card draw the same one.
++func (a *app) proxyField(c *ui.Context, key, label, body string) {
++	sc := m3.Of(c).Scheme
++	if body != "" {
++		settingLabel(c, label, body)
++	}
++	ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
++		input := ui.TextInputBase(c.Key(key), &a.proxyText).
++			Height(48).MinWidth(0).Grow(1).Padding(12).Radius(m3.Medium).Background(sc.SurfaceContainerHigh).
++			TextColor(sc.OnSurface).FontSize(15).Label(label).Placeholder("http://127.0.0.1:7890")
++		if input.Submitted() {
++			a.setProxy(a.proxyText)
++		}
++		if m3.Button(c, m3.ButtonSpec{Label: "Save", Kind: m3.Tonal, Size: m3.Small40, Key: key + "-save"}).Clicked() {
++			a.setProxy(a.proxyText)
++		}
++		if a.proxyCheck.busy() {
++			m3.LoadingIndicator(c, 32, false)
++		} else if m3.Button(c, m3.ButtonSpec{Label: "Test", Kind: m3.Outlined, Size: m3.Small40, Key: key + "-test"}).Clicked() {
++			a.checkProxy()
++		}
++	})
++	if a.proxyError != "" {
++		m3.Text(c, m3.BodyMedium, a.proxyError).TextColor(sc.Error).MaxLines(3)
++	} else if proxy.On() {
++		m3.Text(c, m3.BodyMedium, "Songs and covers load through "+proxy.Address()+".").TextColor(sc.OnSurfaceVariant)
++	}
++}
++
++// networkCard is where the proxy is set after sign-in: the same field, with
++// what it covers.
++func (a *app) networkCard(c *ui.Context) {
++	a.settingsCard(c, "Network", m3.IconRefresh, func() {
++		a.proxyField(c, "proxy-address", "Proxy",
++			"Send everything Meiro loads through a proxy: YouTube Music, covers, lyrics, Last.fm, and the ffmpeg and yt-dlp it starts. Write it as a browser does, like http://127.0.0.1:7890 or socks5://127.0.0.1:1080. Leave it empty to go direct.")
++	})
++}
++
++// proxyChip stands in the top bar while a proxy is set, so the app never
++// quietly reaches the network through one without saying so.
++func (a *app) proxyChip(c *ui.Context) {
++	if !proxy.On() {
++		return
++	}
++	sc := m3.Of(c).Scheme
++	chip := ui.ButtonBase(c.Key("proxy-chip"))
++	chip.Height(32).PaddingX(12).Radius(m3.Full).AlignItems(ui.Center).
++		Label("Proxy: " + proxy.Address()).Tooltip("Proxy: " + proxy.Address()).
++		Background(m3.StateFill(sc.SecondaryContainer, sc.OnSurface, chip.Hovered(), chip.Pressed(), chip.FocusVisible())).
++		Cursor(ui.CursorPointer)
++	chip.Children(func() {
++		ui.Icon(c, m3.IconRefresh).FontSize(16).TextColor(sc.OnSecondaryContainer)
++		m3.Text(c, m3.LabelSmall, "Proxy").TextColor(sc.OnSecondaryContainer)
++	})
++	if chip.Clicked() {
++		if a.router.Location() == routeByID(routeSettings).path("") {
++			// Already there: the page stays, so it takes the filter now.
++			a.settingsSearch = settingsSearchState{query: "proxy", open: true}
++		} else {
++			// Going there closes the filter the page had, so the filter
++			// waits for the visit to start.
++			a.settingsSearchPending = "proxy"
++			a.navigate(routeSettings)
++		}
++	}
++}
+diff --git baseline/notch.go meiro-master/notch.go
+index e83be02..f59b335 100644
+--- baseline/notch.go
++++ meiro-master/notch.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/egoist/mygo"
+ 	"github.com/egoist/mygo/ui"
+ 
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/internal/lyrics"
+ 	"github.com/elianiva/meiro/m3"
+ )
+@@ -251,7 +252,7 @@ func (a *app) notchView(c *ui.Context) {
+ 				launch := ui.ButtonBase(c.Key("notch-open")).Absolute().
+ 					Left((width-compactWidth)/2-notchOpenTarget).Top((headerHeight-notchOpenTarget)/2).
+ 					Size(notchOpenTarget, notchOpenTarget).Center().Radius(8).
+-					Label("Open Meiro").Tooltip("Open Meiro").Cursor(ui.CursorPointer).
++					Label("Open Meiro").Tooltip(lang.T("Open Meiro")).Cursor(ui.CursorPointer).
+ 					Disabled(!open || opacity < 1).Opacity(opacity)
+ 				color := white.Alpha(0.7)
+ 				launch.Background(m3.StateFill(ui.Transparent, color, launch.Hovered(), launch.Pressed(), launch.FocusVisible()))
+@@ -304,7 +305,7 @@ func (a *app) notchView(c *ui.Context) {
+ 				Size(fullWidth, notchLyricsHeight).Padding(8, 16, 16).Gap(14).AlignItems(ui.Center).Disabled(!open)
+ 			body.Opacity(opacity).Children(func() {
+ 				cover := ui.ButtonBase(c.Key("notch-album")).Size(76, 76).Shrink(0).Radius(12).
+-					Label("Open Now Playing").Tooltip("Open Now Playing").Cursor(ui.CursorPointer).
++					Label("Open Now Playing").Tooltip(lang.T("Open Now Playing")).Cursor(ui.CursorPointer).
+ 					Disabled(!open || opacity < 1)
+ 				n.trackInteraction(cover)
+ 				cover.Children(func() {
+diff --git baseline/nowplaying.go meiro-master/nowplaying.go
+index e5977d1..2db035b 100644
+--- baseline/nowplaying.go
++++ meiro-master/nowplaying.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/egoist/mygo/ui"
+ 
+ 	"github.com/elianiva/meiro/internal/keymap"
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/m3"
+ 	"github.com/elianiva/meiro/youtube"
+ )
+@@ -363,7 +364,7 @@ func (a *app) nowPlayingTabs(c *ui.Context, compact bool) {
+ 				label = "Details"
+ 			}
+ 			button.Grow(1).Basis(0).MinWidth(0).Height(m3.MinTarget).Center().Radius(m3.Full).
+-				Cursor(ui.CursorPointer).Label(label).Tooltip(label).Background(ui.Transparent)
++				Cursor(ui.CursorPointer).Label(label).Tooltip(lang.T(label)).Background(ui.Transparent)
+ 			if compact {
+ 				button.Margin(-4, 0).Draw(func(p *ui.Painter, r ui.Rect) {
+ 					r.Y += (r.H - 40) / 2
+diff --git baseline/player/player.go meiro-master/player/player.go
+index 9817d25..558fa2c 100644
+--- baseline/player/player.go
++++ meiro-master/player/player.go
+@@ -27,6 +27,8 @@ import (
+ 	"time"
+ 
+ 	"github.com/ebitengine/oto/v3"
++
++	"github.com/elianiva/meiro/internal/proxy"
+ )
+ 
+ const (
+@@ -643,6 +645,7 @@ func (p *Player) start(ctx context.Context, url string, at time.Duration, paused
+ func (p *Player) decode(ffmpeg, url string, at time.Duration, eq []float64, speed float64) (*session, error) {
+ 	cmd := exec.Command(ffmpeg, streamArgs(url, at, p.rangedHTTP, speed)...) //nolint:noctx // the player ends ffmpeg itself when the stream is replaced or stopped
+ 	hideWindow(cmd)
++	proxy.Apply(cmd)
+ 	pipe, writer, err := os.Pipe()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("player: create audio pipe: %w", err)
+diff --git baseline/playerbar.go meiro-master/playerbar.go
+index 1ab38ee..9d28aba 100644
+--- baseline/playerbar.go
++++ meiro-master/playerbar.go
+@@ -6,6 +6,7 @@ import (
+ 
+ 	"github.com/egoist/mygo/ui"
+ 	"github.com/elianiva/meiro/internal/keymap"
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/m3"
+ 	"github.com/elianiva/meiro/youtube"
+ )
+@@ -302,7 +303,7 @@ func (a *app) trackLine(c *ui.Context, title, subtitle m3.Role, links bool) ui.E
+ 					if part.Target().Kind == youtube.TargetAlbum {
+ 						label = "Go to album: "
+ 					}
+-					link.Label(label + part.Text).Tooltip(label + part.Text)
++					link.Label(label + part.Text).Tooltip(lang.T(label + part.Text))
+ 					if link.Clicked() {
+ 						a.openPlayerLink(part)
+ 					}
+diff --git baseline/settingspage.go meiro-master/settingspage.go
+index 418da7b..8811611 100644
+--- baseline/settingspage.go
++++ meiro-master/settingspage.go
+@@ -13,6 +13,7 @@ import (
+ 
+ 	"github.com/elianiva/meiro/internal/audio"
+ 	"github.com/elianiva/meiro/internal/keymap"
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/internal/settings"
+ 	"github.com/elianiva/meiro/m3"
+ 	"github.com/elianiva/meiro/player"
+@@ -58,6 +59,7 @@ var settingsRows = []settingsRow{
+ 
+ 	{key: "h-look", heading: "Appearance and sound"},
+ 	{key: "appearance", search: "theme appearance system light dark colour color colours colors violet indigo blue sky teal green lime amber orange red rose orchid hue palette tonal spot vibrant expressive neutral monochrome artwork dynamic matugen source", card: (*app).appearanceCard},
++	{key: "language", search: "language chinese english translation locale 语言 中文 简体", card: (*app).languageCard},
+ 	{key: "sound", search: "sound audio normalize loudness logarithmic equaliser volume", card: (*app).soundCard},
+ 
+ 	{key: "h-playback", heading: "Playback"},
+@@ -66,6 +68,7 @@ var settingsRows = []settingsRow{
+ 	{key: "ai", search: "ai artificial intelligence generated exclude skip filter songs", card: (*app).aiFilterCard},
+ 
+ 	{key: "h-system", heading: "System"},
++	{key: "network", search: "network proxy vpn socks http https 代理 网络 代理服务器", card: (*app).networkCard},
+ 	{key: "desktop", search: "desktop linux notifications discord rich presence activity status tray icon wordmark o mark low key subtle notch macbook lyrics", card: (*app).desktopCard},
+ 	{key: "keyboard", search: "keyboard shortcuts keys", card: (*app).keyboardCard},
+ 
+@@ -215,6 +218,33 @@ func settingLabel(c *ui.Context, title, body string) ui.Element {
+ 	})
+ }
+ 
++// languageCard picks the language the interface speaks.
++func (a *app) languageCard(c *ui.Context) {
++	a.settingsCard(c, "Language", m3.IconTrending, func() {
++		ui.Row(c).Gap(16).AlignItems(ui.Center).Wrap().Children(func() {
++			settingLabel(c, "Interface language", "Follow the desktop, or pick one. Simplified Chinese is a translation; anything not translated there stays in English.").Grow(1)
++			language := 0
++			switch settings.LanguageOrDefault(a.settings.Language) {
++			case settings.LanguageEnglish:
++				language = 1
++			case settings.LanguageChinese:
++				language = 2
++			}
++			if m3.ButtonGroup(c, "language", &language, []string{"Auto", "English", "中文"}, nil) {
++				a.setLanguage([]string{settings.LanguageAuto, settings.LanguageEnglish, settings.LanguageChinese}[language])
++			}
++		})
++	})
++}
++
++// setLanguage switches the interface language and keeps the choice.
++func (a *app) setLanguage(language string) {
++	a.settings.Language = settings.LanguageOrDefault(language)
++	lang.Set(a.settings.Language)
++	a.saveSettings()
++	a.refresh()
++}
++
+ func (a *app) appearanceCard(c *ui.Context) {
+ 	sc := m3.Of(c).Scheme
+ 	th := m3.Of(c)
+@@ -504,7 +534,7 @@ func (a *app) swatch(c *ui.Context, name, hex string) bool {
+ 	if b.Pressed() {
+ 		radius = 12
+ 	}
+-	b.Size(56, 56).Radius(max(radius, 0)).Background(fill).Center().Cursor(ui.CursorPointer).Label(name).Tooltip(name)
++	b.Size(56, 56).Radius(max(radius, 0)).Background(fill).Center().Cursor(ui.CursorPointer).Label(name).Tooltip(lang.T(name))
+ 	border := ui.Transparent
+ 	if selected {
+ 		border = sc.Surface
+diff --git baseline/settingswatch.go meiro-master/settingswatch.go
+index 1bdca59..c7a1422 100644
+--- baseline/settingswatch.go
++++ meiro-master/settingswatch.go
+@@ -15,6 +15,7 @@ import (
+ 
+ 	"github.com/fsnotify/fsnotify"
+ 
++	"github.com/elianiva/meiro/internal/lang"
+ 	"github.com/elianiva/meiro/internal/settings"
+ 	"github.com/elianiva/meiro/m3"
+ )
+@@ -249,4 +250,10 @@ func (a *app) applyReloadedSettings(previous settings.Settings) {
+ 	if s.ExcludeAIGenerated != previous.ExcludeAIGenerated {
+ 		a.applyAIFilterChange()
+ 	}
++	if s.Proxy != previous.Proxy {
++		a.applyProxy()
++	}
++	if s.Language != previous.Language {
++		lang.Set(s.Language)
++	}
+ }
+diff --git baseline/shell.go meiro-master/shell.go
+index 139b1dc..17a4617 100644
+--- baseline/shell.go
++++ meiro-master/shell.go
+@@ -289,6 +289,7 @@ func (a *app) topBar(c *ui.Context) {
+ 		var bar ui.Element
+ 		a.hinted(c, func() { bar = a.searchBar(c) }, keymap.Search).Width(520).Shrink(1).MinWidth(0)
+ 		a.searchSuggestions(c, bar)
++		a.proxyChip(c)
+ 		a.accountButton(c)
+ 	})
+ }
+diff --git baseline/signin.go meiro-master/signin.go
+index d013adf..8d17d11 100644
+--- baseline/signin.go
++++ meiro-master/signin.go
+@@ -216,6 +216,11 @@ func (a *app) signInDialog(c *ui.Context) {
+ 		if s.inWindow {
+ 			m3.Text(c, m3.BodyMedium, "Finish signing in in the window that opened. Meiro closes it for you.").TextColor(sc.Primary)
+ 		}
++		// The proxy stands above the sign-in buttons: where Google is out of
++		// reach, nothing signs in until the address does, and the window that
++		// signs in and the app that follows both go through this one.
++		a.proxyField(c, "sign-in-proxy", "Proxy",
++			"If Google is out of reach from this network, sign in through a proxy. The window that signs in and everything Meiro loads go through it. Leave it empty to go direct.")
+ 		toggle := m3.Button(c, m3.ButtonSpec{Label: "Advanced", Icon: advancedIcon(s.advanced), Kind: m3.TextOnly, Key: "sign-in-advanced"})
+ 		if toggle.Clicked() {
+ 			s.advanced = !s.advanced
+diff --git baseline/youtube/client.go meiro-master/youtube/client.go
+index d7a4c09..8bd76c3 100644
+--- baseline/youtube/client.go
++++ meiro-master/youtube/client.go
+@@ -16,6 +16,9 @@ import (
+ 	"strings"
+ 	"sync"
+ 	"time"
++
++	"github.com/elianiva/meiro/internal/lang"
++	"github.com/elianiva/meiro/internal/proxy"
+ )
+ 
+ const (
+@@ -78,13 +81,15 @@ type Client struct {
+ // how long the body may take. The clients share it, and with it their open
+ // connections, so a client made for a new session, or to check one, does not
+ // pay for a handshake of its own. It holds no cookies: a client sends its own
+-// with each request.
++// with each request. Its transport asks proxy.Proxy where to connect, so a
++// proxy the user sets after startup applies to every request.
+ var defaultHTTPClient = func() *http.Client {
+ 	base, ok := http.DefaultTransport.(*http.Transport)
+ 	if !ok {
+-		base = &http.Transport{Proxy: http.ProxyFromEnvironment}
++		base = &http.Transport{}
+ 	}
+ 	transport := base.Clone()
++	transport.Proxy = proxy.Proxy
+ 	transport.ResponseHeaderTimeout = defaultResponseHeaderTimeout
+ 	return &http.Client{Transport: transport}
+ }()
+@@ -104,9 +109,6 @@ func NewClient(options Options) *Client {
+ 	if options.WebClientVersion == "" {
+ 		options.WebClientVersion = defaultWebVersion
+ 	}
+-	if options.Language == "" {
+-		options.Language = "en"
+-	}
+ 	if options.Country == "" {
+ 		options.Country = "US"
+ 	}
+@@ -150,6 +152,11 @@ type clientUserContext struct {
+ func (c *Client) context() clientContext {
+ 	var ctx clientContext
+ 	ctx.Client.HL = c.language
++	if ctx.Client.HL == "" {
++		// No language was picked for this client, so it follows the one the
++		// interface shows, as YouTube Music names its own sections.
++		ctx.Client.HL = lang.HL()
++	}
+ 	ctx.Client.GL = c.country
+ 	if c.cookieAuth == nil {
+ 		ctx.Client.VisitorData = c.currentVisitorData()

@@ -1,0 +1,10 @@
+# The chooser issues open through. Blank issues are on for reports and
+# notes that fit none of the templates.
+blank_issues_enabled: true
+contact_links:
+  - name: Contributing to Meiro
+    url: https://github.com/elianiva/meiro/blob/master/CONTRIBUTING.md
+    about: How to report a problem, set up the project, and open a pull request.
+  - name: Download the latest release
+    url: https://github.com/elianiva/meiro/releases/latest
+    about: Get the newest build for macOS or Linux.
