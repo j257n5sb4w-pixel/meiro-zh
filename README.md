@@ -1,3 +1,11 @@
+> **中文 + 代理补丁版（个人 fork）**，基于上游 Meiro 0.6.1。
+>
+> - 改动说明、安装方法（覆盖 `Meiro.exe` 即可）、升级流程：[CN-PATCH.md](CN-PATCH.md)
+> - 纯代码补丁（可对上游 0.6.1 `git apply`）：[patches/meiro-0.6.1-zh-proxy.patch](patches/meiro-0.6.1-zh-proxy.patch)
+> - 开箱即用的 Windows 构建：[Releases](https://github.com/j257n5sb4w-pixel/meiro-zh/releases)
+>
+> 注意：请勿使用应用内的「Install Update」，它会覆盖成官方版本。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/promo/hero-dark.png">
