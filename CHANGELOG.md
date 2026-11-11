@@ -8,10 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **Meiro can go through a proxy.** Where Google is out of reach, a proxy address in the sign-in dialog carries the window that signs in and everything Meiro loads after it: YouTube Music, covers, lyrics, Last.fm, and the ffmpeg and yt-dlp it starts. Settings has the same field under System, with a button that checks the address against YouTube Music, and a Proxy chip in the top bar links back to it while one is set. Chromium-based sign-in windows and Firefox take the proxy too.
-- **The interface speaks Chinese.** A language switch in Settings picks the desktop's language, English, or Simplified Chinese. Everything Meiro draws is translated at the point it is drawn, so the same session switches between the two without a restart. YouTube Music is asked for its own sections in the same language, so "Music videos for you" comes back as 为你推荐的音乐视频.
+- **Meiro can go through a proxy.** Where Google is out of reach, a proxy address in the sign-in dialog carries the window that signs in and everything Meiro loads after it: YouTube Music, covers, lyrics, Last.fm, the audio cache, and the ffmpeg and yt-dlp it starts. Settings has the same field under System, with a button that checks the address against YouTube Music, and a Proxy chip in the top bar links back to it while one is set. Chromium-based sign-in windows and Firefox take the proxy too.
+- **The interface speaks Chinese.** A language switch in Settings picks the desktop's language, English, or Simplified Chinese. Everything Meiro draws is translated at the point it is drawn, so the same session switches between the two without a restart, and YouTube Music is asked for its content in the same language.
+
+## [0.6.2] - 2026-11-11
+
+### Added
+
+- **A song's menu is shorter.** Copy title, Copy artist and Copy link moved under one Copy row, which opens them on a second page with a back button.
+- **Playback details.** The three-dot menu on the playing song's cover, and the player's own three-dot menu, have a Playback details row. It shows how the song's audio was found (the player request, yt-dlp or a file), the yt-dlp arguments, the format and average bitrate, the output device, and whether your account was used. Copy URL copies the stream address.
+- **Play audio as your account.** A new switch under Playback in Settings makes yt-dlp sign in with your YouTube account, so YouTube Premium gets its higher bitrate. It is off by default, and a song takes a few seconds longer to start. When yt-dlp finds a YouTube Premium subscription on your account, Meiro offers to turn it on, once.
 - **The arrow keys walk the search suggestions.** While the search field shows suggestions, Down and Up highlight them in order, and Enter opens the highlighted one as a click would. Past either end the highlight goes back to the text typed, so Enter searches it. Typing clears the highlight, and Escape closes the suggestions and keeps the text.
 - **Settings offers to support the project.** A new Ko-fi card under About and support has a button that opens the tip page in your browser.
+- **A song's menu copies its title or artist.** The menu on a song, from a right click or its three-dot button, offers Copy title and Copy artist next to Copy link. Copy artist copies every artist the song credits, and a song whose byline names no artist offers only its title.
 
 ### Fixed
 

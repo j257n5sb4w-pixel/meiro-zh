@@ -9,6 +9,7 @@ import (
 	"github.com/egoist/mygo/plugins/updater"
 	"github.com/egoist/mygo/ui"
 
+	"github.com/elianiva/meiro/internal/lang"
 	"github.com/elianiva/meiro/internal/report"
 	"github.com/elianiva/meiro/m3"
 )
@@ -55,6 +56,9 @@ func (a *app) updatesCard(c *ui.Context) {
 // updateSubtitle names the last successful update check, when there was one.
 func updateSubtitle() string {
 	if last := updater.LastCheck(); !last.IsZero() {
+		if lang.Shown() {
+			return lang.T("Last checked ") + last.Format("1月2日 15:04") + "。"
+		}
 		return "Last checked " + last.Format("Jan 2, 15:04") + "."
 	}
 	return "Signed releases install themselves."

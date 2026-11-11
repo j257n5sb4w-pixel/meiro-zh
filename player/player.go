@@ -28,6 +28,7 @@ import (
 
 	"github.com/ebitengine/oto/v3"
 
+	"github.com/elianiva/meiro/internal/lang"
 	"github.com/elianiva/meiro/internal/proxy"
 )
 
@@ -48,6 +49,15 @@ const (
 	// as YouTube's own player and yt-dlp ask.
 	rangeSize = 10 << 20
 )
+
+// OutputFormat describes what the player gives the audio device: the system's
+// default one, at a fixed format ffmpeg decodes every stream to.
+func OutputFormat() string {
+	if lang.Shown() {
+		return fmt.Sprintf("系统默认设备，%d kHz，%d 声道，%d 位 PCM", sampleRate/1000, channelCount, bytesPerSample*8)
+	}
+	return fmt.Sprintf("System default device, %d kHz, %d channels, %d-bit PCM", sampleRate/1000, channelCount, bytesPerSample*8)
+}
 
 // EQFrequencies are the centre frequencies of the equaliser's bands, in Hz.
 // Ten ISO one-octave bands cover the audible range a music player is asked

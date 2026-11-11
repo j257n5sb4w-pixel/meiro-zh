@@ -388,7 +388,7 @@ func TestRightClickingASuggestionOffersItsMenu(t *testing.T) {
 		t.Fatal(err)
 	}
 	tt.Frame()
-	for _, want := range []string{"Play next", "Add to queue", "Add to playlist", "Copy link"} {
+	for _, want := range []string{"Play next", "Add to queue", "Add to playlist", "Copy"} {
 		if !tt.HasText(want) {
 			t.Errorf("right-clicking a song among the suggestions offered no %q: %q", want, tt.Texts())
 		}
@@ -432,6 +432,82 @@ func TestRightClickingASuggestionOffersItsMenu(t *testing.T) {
 	if a.current.VideoID != "" {
 		t.Errorf("a right click played %q", a.current.VideoID)
 	}
+}
+
+// A song's menu copies the song's title or every artist it credits, from a
+// right click or its menu button. A song whose byline links no artist has no
+// artist to offer.
+func TestASongsMenuCopiesItsTitleAndArtist(t *testing.T) {
+	a := newTestApp(t)
+	a.router.Push("/playlist/VLPL_metadata")
+	tt := ui.NewTester(a.view, 1180, 850)
+	tt.Frame()
+
+	if err := tt.RightClick("Linked Track"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.Click("Copy"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if !tt.HasText("Copy title") || !tt.HasText("Copy artist") {
+		t.Fatalf("the copy page of a song with credits offered %q", tt.Texts())
+	}
+	if err := tt.Click("Copy title"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if got := tt.Clipboard(); got != "Linked Track" {
+		t.Errorf("Copy title copied %q, want the song's title", got)
+	}
+	if a.menu.open {
+		t.Error("the menu stayed open after Copy title")
+	}
+
+	// The menu button offers the same actions as the right click.
+	row, ok := tt.Find("Linked Track")
+	if !ok {
+		t.Fatalf("the song row is missing: %q", tt.Texts())
+	}
+	tt.Move(row.X+row.W/2, row.Y+row.H/2)
+	tt.Frame()
+	if err := tt.Click("More options for Linked Track"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.Click("Copy"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.Click("Copy artist"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if got := tt.Clipboard(); got != "Aurora Vale, Guest Artist" {
+		t.Errorf("Copy artist copied %q, want every credited artist", got)
+	}
+	if a.menu.open {
+		t.Error("the menu stayed open after Copy artist")
+	}
+
+	// A song whose byline links no artist has a title to copy, but none to
+	// credit.
+	if err := tt.RightClick("Unlinked Track"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.Click("Copy"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if !tt.HasText("Copy title") {
+		t.Errorf("the copy page of a song without credits offered %q", tt.Texts())
+	}
+	if tt.HasText("Copy artist") {
+		t.Errorf("the menu on a song without credits offered Copy artist: %q", tt.Texts())
+	}
+	a.menu.close()
 }
 
 // The search field is in the top bar of every page of YouTube Music, and
@@ -665,8 +741,8 @@ func TestRightClickingASearchResultOffersItsMenu(t *testing.T) {
 		if !tt.HasText(c.offer) {
 			t.Errorf("right-clicking %q offered no %q: %q", c.result, c.offer, tt.Texts())
 		}
-		if !tt.HasText("Copy link") {
-			t.Errorf("the menu on %q has no Copy link: %q", c.result, tt.Texts())
+		if !tt.HasText("Copy") {
+			t.Errorf("the menu on %q has no Copy: %q", c.result, tt.Texts())
 		}
 		a.menu.close()
 		tt.Frame()

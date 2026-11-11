@@ -1,19 +1,19 @@
 # Meiro 中文 + 代理补丁（Windows）
 
-基于 [elianiva/meiro](https://github.com/elianiva/meiro) **0.6.1**，遵循上游 **GPL-3.0**。
+基于 [elianiva/meiro](https://github.com/elianiva/meiro) **0.6.2**，遵循上游 **GPL-3.0**。
 这个仓库是完整源码（已打补丁），不是只有 diff——克隆下来直接就能编。
 
 ---
 
 ## 一、直接用（覆盖 exe 即可）
 
-1. 先装好官方 Meiro 0.6.1（本机是 `D:\Meiro`）。
-2. 到本仓库 **Releases** 下载 `Meiro.exe`。
+1. 先装好官方 Meiro 0.6.2（本机是 `D:\Meiro`）。
+2. 到本仓库 **Releases** 下载 `Meiro-0.6.2-zh.1-win64.zip` 并解压出 `Meiro.exe`。
 3. 备份后覆盖：把下载的文件改名/覆盖到 `D:\Meiro\Meiro.exe`。
 4. 打开 Meiro → **设置 → 系统 → 网络**，填代理地址（例如 `http://127.0.0.1:7897`）→ **保存** → **测试**。
 5. 登录：**设置 → 账户 → 登录**，弹出的对话框里同样有代理框。
 
-> 覆盖前建议先 `copy Meiro.exe Meiro.exe.bak`。原始 0.6.1 的 exe 是 23,577,088 字节。
+> 覆盖前建议先 `copy Meiro.exe Meiro.exe.bak`。原始 0.6.2 的 exe 见上游 Release。
 
 ---
 
@@ -77,7 +77,7 @@ Windows 上保存的 cookie 是 **用这个 identifier 当服务名**存进「�
 ```bash
 git clone https://github.com/elianiva/meiro.git meiro-new
 cd meiro-new
-git apply --3way /path/to/patches/meiro-0.6.1-zh-proxy.patch
+git apply --3way /path/to/patches/meiro-0.6.2-zh-proxy.patch
 ```
 
 冲突一般出在这几个文件，手动合一下就行：
@@ -119,4 +119,4 @@ network.go                  代理设置卡片、代理字段、顶栏胶囊
 - **无障碍标签**（屏幕阅读器读的那层）仍是英文。上游的 UI 测试就是靠英文文本定位控件的（`Tester.Click("Sign in with a browser window")`），改了会挂一片测试，所以刻意保留。
 - 歌曲名、专辑名、歌手名属于内容，不翻译。
 - 播放栏里的 `158K views` 这类文案来自 YouTube 返回的数据，会随内容语言变化。
-- 词条表是按 0.6.1 的界面抓的；上游加新界面文案时，新文案会显示英文，往 `internal/lang/zh.go` 里补一行即可。
+- 词条表是按 0.6.2 的界面抓的；上游加新界面文案时，新文案会显示英文，往 `internal/lang/zh.go` 里补一行即可。

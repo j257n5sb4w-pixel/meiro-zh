@@ -49,12 +49,19 @@ func (a *app) view(c *ui.Context) {
 
 	a.syncLocation()
 	if a.notice != "" {
-		if a.noticeHelp {
+		switch {
+		case a.noticePremium:
+			c.AddToast(ui.Toast{Title: a.notice, Action: "Turn on", OnAction: func() {
+				a.settings.AccountAudio = true
+				a.syncAudioAuth()
+				a.saveSettings()
+			}})
+		case a.noticeHelp:
 			c.AddToast(ui.Toast{Title: a.notice, Action: "Learn more", OnAction: a.openToolHelp})
-		} else {
+		default:
 			c.Toast(a.notice)
 		}
-		a.notice, a.noticeHelp = "", false
+		a.notice, a.noticeHelp, a.noticePremium = "", false, false
 	}
 	a.syncSignInDialog()
 
@@ -72,6 +79,7 @@ func (a *app) view(c *ui.Context) {
 	a.deletePlaylistDialog(c)
 	a.addToPlaylistDialog(c)
 	a.toolHelpDialog(c)
+	a.nerdDialog(c)
 	a.crashDialog(c)
 	m3.Snackbars(c, 0)
 	a.shortcuts(c)

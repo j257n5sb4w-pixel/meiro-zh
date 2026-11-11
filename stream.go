@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/elianiva/meiro/internal/audio"
@@ -15,17 +16,70 @@ import (
 // and falls back to yt-dlp, which knows more ways to ask, when that fails.
 // Asking directly takes a request, where yt-dlp starts a Python process of
 // about 70 MB and takes a couple of seconds.
-func resolveAudio(client *youtube.Client) audio.Resolver {
+func resolveAudio(client *youtube.Client, auth *audioAuth, traces *resolveTraces) audio.Resolver {
 	return func(ctx context.Context, videoID string) (string, time.Duration, error) {
+		trace := resolveTrace{VideoID: videoID, Signed: false}
+		started := time.Now()
+		defer func() { trace.Elapsed = time.Since(started); traces.put(trace) }()
+		// A signed-in resolve goes to yt-dlp alone: the direct request is
+		// anonymous, so it would never return the account's own formats.
+		if cookie := auth.get(); cookie != "" {
+			trace.Source, trace.Signed = "yt-dlp", true
+			url, total, run, err := ytdlp.Resolve(ctx, videoID, cookie)
+			trace.Run, trace.URL = run, url
+			return url, total, err
+		}
 		url, total, err := client.AudioStream(ctx, videoID)
 		if err == nil {
+			trace.Source, trace.URL = "YouTube player request", url
 			return url, total, nil
 		}
+		trace.DirectError = err.Error()
 		if ctx.Err() != nil {
 			return "", 0, err
 		}
 		log.Printf("playback: direct resolve failed video_id=%s, trying yt-dlp: %v", videoID, err)
-		return ytdlp.Resolve(ctx, videoID)
+		trace.Source = "yt-dlp"
+		var run ytdlp.Run
+		url, total, run, err = ytdlp.Resolve(ctx, videoID, "")
+		trace.Run, trace.URL = run, url
+		return url, total, err
+	}
+}
+
+// audioAuth holds the cookie that audio is resolved with, or "" to resolve
+// anonymously. Resolving runs off the main thread, so it reads this instead
+// of the account.
+type audioAuth struct {
+	mu     sync.Mutex
+	cookie string
+}
+
+func (s *audioAuth) get() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cookie
+}
+
+// set replaces the cookie and reports whether it changed.
+func (s *audioAuth) set(cookie string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := s.cookie != cookie
+	s.cookie = cookie
+	return changed
+}
+
+// syncAudioAuth makes audio resolve with the signed-in account when the user
+// asked for it, and anonymously otherwise. URLs resolved the other way are
+// dropped, so the next play asks again.
+func (a *app) syncAudioAuth() {
+	cookie := ""
+	if a.settings.AccountAudio && a.account.session != nil {
+		cookie = a.account.session.cookie
+	}
+	if a.audioAuth.set(cookie) {
+		a.streams.Reset()
 	}
 }
 
@@ -131,6 +185,7 @@ func (a *app) audioStarted(item youtube.MusicItem, found resolvedAudio, position
 	} else if changed {
 		a.reportPlayback(item)
 	}
+	a.playing = playingAudio{videoID: item.VideoID, url: found.url, file: found.fromCache}
 	if !found.fromCache {
 		// The direct URL is already in hand, so the cache downloads it as it
 		// is instead of resolving the same track again.
@@ -400,5 +455,33 @@ func (a *app) warmNext() {
 		if cache.Warmable() {
 			cache.Add(next.VideoID, url)
 		}
+	})
+}
+
+// offerPremium tells a signed-in Premium account, once, that it can play
+// audio as itself. yt-dlp is the one that knows whether the account has
+// Premium, so it is asked in the background; the answer is dropped if the
+// account changed meanwhile.
+func (a *app) offerPremium() {
+	s := a.account.session
+	if s == nil || a.settings.AccountAudio || a.settings.PremiumOffered {
+		return
+	}
+	hasPremium := a.hasPremium
+	spawn(a, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		premium, err := hasPremium(ctx, s.cookie)
+		if err != nil {
+			log.Printf("account: premium check failed: %v", err)
+		}
+		return premium
+	}, func(premium bool) {
+		if !premium || a.account.session != s || a.settings.AccountAudio || a.settings.PremiumOffered {
+			return
+		}
+		a.settings.PremiumOffered = true
+		a.saveSettings()
+		a.notice, a.noticePremium = "YouTube Premium found. Play audio as your account for higher bitrate?", true
 	})
 }

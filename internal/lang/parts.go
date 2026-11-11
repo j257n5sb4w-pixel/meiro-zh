@@ -87,6 +87,8 @@ func build() []part {
 		{en: " days", zh: " 天"},
 		{en: " plays", zh: " 次播放"},
 		{en: " play", zh: " 次播放"},
+		{en: "Sign in again to see ", zh: "重新登录以查看 "},
+		{en: " tracks", zh: " 首歌曲"},
 	}
 	for i := range table {
 		first, _ := utf8.DecodeRuneInString(table[i].en)
